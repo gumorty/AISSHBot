@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Runtime-only state: never commit credentials, host trust records, audit data, or logs.
+data/access_policy.json
+data/servers.json
+data/ops_audit.jsonl
+secrets/
+logs/
+run/

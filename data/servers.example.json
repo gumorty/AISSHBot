@@ -1,0 +1,19 @@
+{
+  "server1": {
+    "name": "AI GPU服务器1",
+    "transport": "local",
+    "read_roots": ["/home/uav"],
+    "write_roots": []
+  },
+  "server2": {
+    "name": "阿里云服务器",
+    "transport": "ssh",
+    "host": "REPLACE_WITH_HOST",
+    "port": 22,
+    "username": "readonly-service-account",
+    "credential_ref": "server2",
+    "known_hosts": "secrets/server2_known_hosts",
+    "read_roots": ["/"],
+    "write_roots": []
+  }
+}

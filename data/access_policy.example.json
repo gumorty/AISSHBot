@@ -1,0 +1,14 @@
+{
+  "default_effect": "deny",
+  "users": [
+    {
+      "user_id": "owner-internal",
+      "display_name": "管理员",
+      "identities": [{"platform": "openclaw-weixin", "external_id": "person_example@im.wechat"}],
+      "grants": {
+        "server1": {"operations": ["inventory", "health", "processes", "paper_progress", "java_status"]},
+        "server2": {"operations": ["inventory", "health", "processes", "java_status"]}
+      }
+    }
+  ]
+}
