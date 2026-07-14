@@ -10,3 +10,4 @@ data/ops_audit.jsonl
 secrets/
 logs/
 run/
+.local-server1-known_hosts
