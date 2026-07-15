@@ -5,17 +5,22 @@
 ## 当前链路
 
 ```text
-微信 ClawBot → LangBot → 身份绑定 / RBAC → 规则优先的意图规划
-→ 白名单只读网关 → 本机或 SSH 资产 → 审计 → 微信回复
+微信 ClawBot → LangBot → 身份绑定 / RBAC → 每用户短期上下文
+→ 规则优先的意图规划 → 白名单只读网关 → 本机或 SSH 资产
+→ 精简格式化 / 审计 → 微信回复
 ```
 
-LLM 只能在规则不能确定时，从固定的 `inventory`、`health`、`processes`、`paper_progress`、`java_status` 中选择工具和已授权资产；它不会获得 SSH 凭据，也不能生成 Shell 命令。
+LLM 只能在本地规则不能确定时，从固定的 `inventory`、`select_server`、`health`、`processes`、`paper_progress`、`java_status`、`service_status`、`service_logs` 中选择工具和已授权资产；它不会获得 SSH 凭据、命令输出，也不能生成 Shell 命令。
+
+每个内部用户拥有独立的 30 分钟短期上下文，最多保留 6 轮，用于理解“那它呢”“再看一下进程”等追问。上下文只存在于 AISSHBot 进程内，不跨用户共享，服务重启后自动清空。
+
+当前响应会先提取数量、异常状态和关键指标，再输出短表格；不会直接返回完整命令行、环境变量、绝对路径或无限制日志。
 
 ## 安全边界
 
 - 默认拒绝未绑定聊天账号和未授权服务器。
 - 所有远程 SSH 资产必须提供已验证的 `known_hosts` 公钥；缺失时拒绝连接，绝不自动接受主机密钥。
-- 当前无上传、删除、重启、部署、任意路径读取或任意 Shell 功能。
+- 当前无上传、删除、重启、部署、任意路径读取或任意 Shell 功能。服务日志只允许 `nginx`、`docker`，最多返回最近 10 行并进行敏感字段脱敏。
 - 审计记录仅保存操作者、资产、操作、结果状态和时间；不保存命令输出或凭据。
 - 运行时凭据、审计数据、可信主机密钥和服务器真实配置全部被 `.gitignore` 排除。
 
@@ -30,4 +35,4 @@ python -m pip install -e .
 python -m pytest
 ```
 
-部署适配层负责将 LangBot 的 `adapter.name` 和 `sender_id` 传给 `AccessPolicy`，并只在 `authorize()` 成功后调用 `ReadonlyGateway.execute()`。
+部署适配层负责将 LangBot 的 `adapter.name` 和 `sender_id` 传给 `resolve_principal()`，并只在 `authorize()` 成功后调用 `execute_readonly()`。

@@ -5,14 +5,17 @@ The LangBot/OpenClaw message handler is only an adapter. It must not open an SSH
 ```text
 incoming WeChat message
   → router.classify()
-  → immediate PROCESSING_ACK for server requests
-  → AccessPolicy.resolve_principal(adapter.name, sender_id)
-  → AccessPolicy.visible_servers() and authorize()
-  → intent_planner.plan_operation()
-  → ReadonlyGateway.execute()
-  → bounded response + audit record
+  → known read-only query: execute directly; complex request: immediate PROCESSING_ACK
+  → resolve_principal(adapter.name, sender_id)
+  → allowed_server_ids() and authorize()
+  → ShortTermMemory.get() + intent_planner.plan_operation()
+  → ShortTermMemory.apply() for follow-up context
+  → execute_readonly()
+  → concise table/summary + audit record + ShortTermMemory.remember()
 ```
 
-For recognized operations, `plan_operation()` returns a local rule result and does not call the LLM. Only an unrecognized message may use a fallback planner, which receives the user text, allowed operation names and allowed asset IDs—never SSH credentials, shell commands, file contents or command output.
+For recognized operations, `plan_operation()` returns a local rule result and does not call the LLM. Only an unrecognized message may use a fallback planner, which receives the current user text, short context metadata, allowed operation names and allowed asset IDs—never SSH credentials, shell commands, file contents or command output.
+
+The memory key is the bound internal user ID, not a nickname or chat-room ID. It expires after 30 minutes and keeps at most six turns. Raw log output must not be forwarded into the LLM planner.
 
 The adapter should record only a one-way hash of the sender ID in diagnostic logs. A new platform must add an explicit identity binding; do not map users by display name.

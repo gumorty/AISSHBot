@@ -1,16 +1,14 @@
-"""Safe, rule-first operation planner.
-
-The fallback is dependency-injected so the gateway stays independent from a
-specific LLM framework. A fallback may only return an operation and asset ID.
-"""
+"""Rule-first planner with a tightly constrained LLM fallback."""
 
 from __future__ import annotations
 
-import inspect
-from collections.abc import Awaitable, Callable
+import json
+import re
 from dataclasses import dataclass
+from typing import Iterable
 
-from .intent import OperationIntent, SAFE_OPERATIONS, detect_intent
+from .intent import OperationIntent, SAFE_OPERATIONS, detect_intent, llm_planner_prompt
+from .memory import SessionContext
 
 
 @dataclass(frozen=True)
@@ -20,22 +18,101 @@ class OperationPlan:
     confidence: float
 
 
-async def plan_operation(
+def _parse_json(content: str) -> dict | None:
+    match = re.search(r"\{.*\}", content or "", re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _context_summary(context: SessionContext | None) -> str:
+    if context is None:
+        return ""
+    parts = []
+    if context.last_server_id:
+        parts.append(f"上次服务器={context.last_server_id}")
+    if context.last_operation:
+        parts.append(f"上次操作={context.last_operation}")
+    if context.last_target:
+        parts.append(f"上次目标={context.last_target}")
+    return "；".join(parts)
+
+
+async def _llm_plan(
+    ap,
+    query,
     message: str,
-    visible_servers: list[str],
-    fallback: Callable[[str, list[str]], OperationIntent | None | Awaitable[OperationIntent | None]] | None = None,
+    allowed_servers: Iterable[str],
+    context: SessionContext | None,
+) -> OperationPlan | None:
+    if ap is None or query is None or not getattr(query, "use_llm_model_uuid", None):
+        return None
+
+    from langbot_plugin.api.entities.builtin.provider import message as provider_message
+
+    allowed = list(allowed_servers)
+    model = await ap.model_mgr.get_model_by_uuid(query.use_llm_model_uuid)
+    if model is None:
+        return None
+    prompt = llm_planner_prompt(message, allowed, _context_summary(context))
+    extra_args = dict(model.model_entity.extra_args or {})
+    extra_args.update({"temperature": 0.0, "max_tokens": 180, "enable_thinking": False})
+    response = await model.requester.invoke_llm(
+        query,
+        model,
+        [
+            provider_message.Message(role="system", content="只返回合法 JSON，不解释。"),
+            provider_message.Message(role="user", content=prompt),
+        ],
+        [],
+        extra_args=extra_args,
+        remove_think=True,
+    )
+    payload = _parse_json(response.content if isinstance(response.content, str) else "")
+    if not payload:
+        return None
+
+    operation = str(payload.get("operation", "unknown"))
+    server_id = str(payload.get("server_id", "unknown"))
+    target = payload.get("target")
+    detail = str(payload.get("detail", "summary"))
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if operation not in SAFE_OPERATIONS or server_id not in allowed or confidence < 0.6:
+        return None
+    if target not in (None, "nginx", "docker"):
+        return None
+    if detail not in ("count", "summary", "detail"):
+        detail = "summary"
+    return OperationPlan(
+        OperationIntent(operation, server_id, False, target=target, detail=detail),
+        "llm_fallback",
+        confidence,
+    )
+
+
+async def plan_operation(
+    ap,
+    query,
+    message: str,
+    allowed_servers: Iterable[str],
+    context: SessionContext | None = None,
 ) -> OperationPlan:
-    """Plan known requests locally; call an LLM fallback only for unknown ones."""
-    rule = detect_intent(message)
+    """Route known requests locally; use the LLM only when rules cannot decide."""
+    allowed = list(allowed_servers)
+    default_server = context.last_server_id if context else None
+    rule = detect_intent(message, default_server_id=default_server)
     if rule is not None:
         return OperationPlan(rule, "rule", 0.95)
-    if fallback is None:
-        return OperationPlan(None, "unknown", 0.0)
-    candidate = fallback(message, visible_servers)
-    if inspect.isawaitable(candidate):
-        candidate = await candidate
-    if candidate is None or candidate.operation not in SAFE_OPERATIONS:
-        return OperationPlan(None, "unknown", 0.0)
-    if candidate.server_id not in visible_servers:
-        return OperationPlan(None, "unknown", 0.0)
-    return OperationPlan(candidate, "llm_fallback", 0.5)
+    try:
+        fallback = await _llm_plan(ap, query, message, allowed, context)
+        if fallback is not None:
+            return fallback
+    except Exception:
+        pass
+    return OperationPlan(None, "unknown", 0.0)
