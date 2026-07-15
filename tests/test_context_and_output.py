@@ -62,11 +62,11 @@ uav 258293 Ssl 10:23:05 76.7 1.4 python
 uav 258636 Sl 10:22:59 3.7 0.9 pt_data_worker
 """
     count = _format_processes("AI GPU服务器1", process_raw, "count")
-    assert "共 321 个进程" in count
+    assert "系统进程：321 个" in count
     assert "258292" not in count
     summary = _format_processes("AI GPU服务器1", process_raw, "summary")
-    assert "PID | 程序 | CPU | 内存 | 时长" in summary
-    assert summary.count("\n") <= 6
+    assert "python（PID 258292）" in summary
+    assert "|" not in summary
 
     gpu_raw = """0, NVIDIA GeForce RTX 4090, 90, 19309, 46068
 1, NVIDIA GeForce RTX 4090, 100, 19369, 49140
@@ -75,9 +75,11 @@ __APPS__
 258293, /home/uav/env/bin/python, 19360
 """
     gpu = _format_gpu("AI GPU服务器1", gpu_raw)
-    assert "0 | 90% | 18.9/45.0 GB | 高负载" in gpu
+    assert "GPU 0：高负载" in gpu
+    assert "利用率 90% · 显存 18.9 / 45.0 GB" in gpu
     assert "计算任务：2 个（python）" in gpu
     assert "/home/uav" not in gpu
+    assert "|" not in gpu
 
     medium_gpu = _format_gpu(
         "AI GPU服务器1",
@@ -98,7 +100,7 @@ disk_used_kb=52428800
 disk_pct=50%
 """
     output = _format_health("node1", raw)
-    assert "内存：16.0/32.0 GB（50%）" in output
+    assert "内存：16.0 / 32.0 GB（50%）" in output
     assert "结论：资源状态正常" in output
 
     assert "systemctl is-active nginx" in _command_for(

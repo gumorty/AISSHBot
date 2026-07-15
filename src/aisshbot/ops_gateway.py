@@ -191,8 +191,9 @@ def _kv_and_rows(raw: str, marker: str = "__ROWS__") -> tuple[dict[str, str], li
     return values, rows
 
 
-def _compact_table(headers: list[str], rows: list[list[str]]) -> str:
-    return "\n".join([" | ".join(headers)] + [" | ".join(row) for row in rows])
+def _mobile_items(items: list[str]) -> str:
+    """Format narrow, readable WeChat messages without pseudo-tables."""
+    return "\n".join(f"• {item}" for item in items)
 
 
 def _format_health(name: str, raw: str) -> str:
@@ -214,13 +215,15 @@ def _format_health(name: str, raw: str) -> str:
     if disk_pct >= 90:
         warnings.append("根分区空间不足")
     conclusion = "；".join(warnings) if warnings else "资源状态正常"
-    return (
-        f"【{name} · 资源概览】\n"
-        f"CPU：{cores} 核，1分钟负载 {load:g}\n"
-        f"内存：{used_kb / 1048576:.1f}/{total_kb / 1048576:.1f} GB（{mem_pct}%）\n"
-        f"磁盘：{disk_used / 1048576:.1f}/{disk_total / 1048576:.1f} GB（{disk_pct}%）\n"
-        f"运行时间：{values.get('uptime', '未知')}\n"
-        f"结论：{conclusion}。"
+    return "【%s · 资源概览】\n%s\n结论：%s。" % (
+        name,
+        _mobile_items([
+            f"CPU：{cores} 核，1 分钟负载 {load:g}",
+            f"内存：{used_kb / 1048576:.1f} / {total_kb / 1048576:.1f} GB（{mem_pct}%）",
+            f"磁盘：{disk_used / 1048576:.1f} / {disk_total / 1048576:.1f} GB（{disk_pct}%）",
+            f"运行时间：{values.get('uptime', '未知')}",
+        ]),
+        conclusion,
     )
 
 
@@ -229,7 +232,14 @@ def _format_processes(name: str, raw: str, detail: str) -> str:
     total = _as_int(values.get("total"))
     account = _as_int(values.get("account"))
     abnormal = _as_int(values.get("abnormal"))
-    summary = f"【{name} · 进程】\n共 {total} 个进程；执行账号 {account} 个；D/Z 异常状态 {abnormal} 个。"
+    summary = (
+        f"【{name} · 进程概览】\n"
+        + _mobile_items([
+            f"系统进程：{total:,} 个",
+            f"当前账号：{account:,} 个",
+            f"异常状态（D/Z）：{abnormal} 个",
+        ])
+    )
     if detail == "count":
         return summary
     limit = 5 if detail == "detail" else 3
@@ -238,10 +248,13 @@ def _format_processes(name: str, raw: str, detail: str) -> str:
         fields = line.split(maxsplit=6)
         if len(fields) == 7:
             user, pid, state, elapsed, cpu, memory, command = fields
-            rows.append([pid, command, f"{cpu}%", f"{memory}%", elapsed])
+            rows.append(
+                f"{command}（PID {pid}）\n"
+                f"  CPU {cpu}% · 内存 {memory}% · 已运行 {elapsed}"
+            )
     if not rows:
         return summary
-    return summary + "\n高占用进程：\n" + _compact_table(["PID", "程序", "CPU", "内存", "时长"], rows)
+    return summary + "\n\n高占用进程\n" + _mobile_items(rows)
 
 
 def _format_java(name: str, raw: str) -> str:
@@ -257,11 +270,14 @@ def _format_java(name: str, raw: str) -> str:
             pid, user, state, elapsed, cpu, memory, command = fields
             if state.startswith(("D", "Z")):
                 abnormal += 1
-            rows.append([pid, state, f"{cpu}%", f"{memory}%", elapsed])
+            rows.append(
+                f"PID {pid}：{state} 状态\n"
+                f"  CPU {cpu}% · 内存 {memory}% · 已运行 {elapsed}"
+            )
     conclusion = "发现异常状态，请进一步排查" if abnormal else "未发现 D/Z 异常状态"
     text = f"【{name} · Java】共 {count} 个进程；{conclusion}。"
     if rows:
-        text += "\nPID | 状态 | CPU | 内存 | 时长\n" + "\n".join(" | ".join(row) for row in rows)
+        text += "\n\n进程详情\n" + _mobile_items(rows)
     return text
 
 
@@ -270,6 +286,7 @@ def _format_gpu(name: str, raw: str) -> str:
         return f"【{name} · GPU】未安装或无法访问 nvidia-smi。"
     gpu_part, _, app_part = raw.partition("__APPS__")
     gpu_rows = []
+    gpu_utils = []
     high_count = 0
     for line in gpu_part.splitlines():
         fields = [item.strip() for item in line.split(",")]
@@ -280,7 +297,11 @@ def _format_gpu(name: str, raw: str) -> str:
         status = "高负载" if util >= 80 else "运行中" if util >= 20 else "空闲"
         if util >= 80:
             high_count += 1
-        gpu_rows.append([index, f"{util}%", f"{used / 1024:.1f}/{total / 1024:.1f} GB", status])
+        gpu_utils.append(util)
+        gpu_rows.append(
+            f"GPU {index}：{status}\n"
+            f"  利用率 {util}% · 显存 {used / 1024:.1f} / {total / 1024:.1f} GB"
+        )
     app_lines = [line for line in app_part.splitlines() if line.strip()]
     app_names = []
     for line in app_lines:
@@ -290,7 +311,7 @@ def _format_gpu(name: str, raw: str) -> str:
     app_summary = "、".join(sorted(set(app_names))) or "无"
     if not gpu_rows:
         return f"【{name} · GPU】没有采集到显卡数据。"
-    max_util = max(_as_int(row[1]) for row in gpu_rows)
+    max_util = max(gpu_utils)
     if high_count:
         conclusion = f"{high_count}/{len(gpu_rows)} 张 GPU 处于高负载，训练/计算任务正在运行"
     elif max_util >= 20 or app_lines:
@@ -299,8 +320,8 @@ def _format_gpu(name: str, raw: str) -> str:
         conclusion = "GPU 当前基本空闲"
     return (
         f"【{name} · GPU】\n"
-        + _compact_table(["卡", "利用率", "显存", "状态"], gpu_rows)
-        + f"\n计算任务：{len(app_lines)} 个（{app_summary}）\n结论：{conclusion}。"
+        + _mobile_items(gpu_rows)
+        + f"\n\n计算任务：{len(app_lines)} 个（{app_summary}）\n结论：{conclusion}。"
     )
 
 
@@ -344,10 +365,14 @@ def _format_inventory(visible_server_ids: list[str]) -> str:
         config = servers.get(server_id)
         if config:
             transport = "本机" if config.get("transport") == "local" else "SSH"
-            rows.append([config["name"], server_id, transport, "只读"])
+            rows.append(f"{config['name']}（{server_id}）\n  {transport} · 只读")
     if not rows:
         return "当前没有可访问的服务器。"
-    return "【可操作服务器】\n" + _compact_table(["名称", "标识", "连接", "权限"], rows)
+    return (
+        "【可操作服务器】\n"
+        + "\n".join(f"{index + 1}. {row}" for index, row in enumerate(rows))
+        + "\n\n回复“切换到服务器1”或“切换到阿里云服务器”可设为默认服务器。"
+    )
 
 
 def _command_for(intent: OperationIntent) -> str:
