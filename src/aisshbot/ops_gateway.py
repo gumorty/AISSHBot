@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import fnmatch
+import io
 import json
 import os
 import re
+import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,34 +50,53 @@ READONLY_COMMANDS = {
         "echo '__ROWS__'; "
         "ps -eo pid=,user=,stat=,etime=,%cpu=,%mem=,comm= --sort=-%cpu | awk '$7==\"java\"{print}' | head -n 6"
     ),
-    "paper_progress": (
+    "gpu_overview": (
         "if command -v nvidia-smi >/dev/null 2>&1; then "
         "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits; "
         "echo '__APPS__'; "
         "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits; "
         "else echo 'nvidia-smi=unavailable'; fi"
     ),
+    "gpu_processes": (
+        "if command -v nvidia-smi >/dev/null 2>&1; then "
+        "echo '__GPU_PROCESSES__'; "
+        "nvidia-smi --query-compute-apps=pid,process_name,used_memory "
+        "--format=csv,noheader,nounits 2>/dev/null | "
+        "while IFS=, read -r pid pname gpu_mem; do "
+        "case \"$pid\" in ''|*[!0-9]*) continue;; esac; "
+        "ps -p \"$pid\" -o user=,pid=,ppid=,stat=,etime=,%cpu=,%mem=,comm= 2>/dev/null | "
+        "awk -v gpu_mem=\"$gpu_mem\" '{print gpu_mem \"|\" $0}'; "
+        "done; "
+        "else echo 'nvidia-smi=unavailable'; fi"
+    ),
+    "middleware_overview": (
+        "echo '__UNITS__'; "
+        "for unit in nginx mysql mysqld mariadb mosquitto emqx redis redis-server docker; do "
+        "active=$(systemctl is-active \"$unit\" 2>/dev/null || true); "
+        "enabled=$(systemctl is-enabled \"$unit\" 2>/dev/null || true); "
+        "pid=$(systemctl show \"$unit\" -p MainPID --value 2>/dev/null || true); "
+        "[ -n \"$active$enabled$pid\" ] && printf '%s|%s|%s|%s\\n' \"$unit\" \"$active\" \"$enabled\" \"${pid:-0}\"; "
+        "done; "
+        "echo '__PROCESSES__'; "
+        "ps -eo pid=,user=,stat=,etime=,%cpu=,%mem=,comm= --sort=-%cpu | "
+        "awk '$7 ~ /^(java|nginx|mysqld|mariadbd|mosquitto|emqx|redis-server)$/ {print}' | head -n 15"
+    ),
 }
 
-SERVICE_STATUS_COMMANDS = {
-    "nginx": (
-        "printf 'service=nginx\\n'; "
-        "printf 'active=%s\\n' \"$(systemctl is-active nginx 2>/dev/null || true)\"; "
-        "printf 'enabled=%s\\n' \"$(systemctl is-enabled nginx 2>/dev/null || true)\"; "
-        "printf 'main_pid=%s\\n' \"$(systemctl show nginx -p MainPID --value 2>/dev/null || echo 0)\""
-    ),
-    "docker": (
-        "printf 'service=docker\\n'; "
-        "printf 'active=%s\\n' \"$(systemctl is-active docker 2>/dev/null || true)\"; "
-        "printf 'enabled=%s\\n' \"$(systemctl is-enabled docker 2>/dev/null || true)\"; "
-        "printf 'containers=%s\\n' \"$(docker ps -q 2>/dev/null | wc -l)\""
-    ),
+SERVICE_UNITS = {
+    "nginx": ("nginx",),
+    "docker": ("docker",),
+    "mysql": ("mysql", "mysqld", "mariadb"),
+    "mqtt": ("mosquitto", "emqx"),
+    "redis": ("redis", "redis-server"),
 }
 
-SERVICE_LOG_COMMANDS = {
-    "nginx": "journalctl -u nginx --no-pager -n 20 -o short-iso 2>&1 | tail -n 20",
-    "docker": "journalctl -u docker --no-pager -n 20 -o short-iso 2>&1 | tail -n 20",
-}
+HARD_DENIED_PATHS = (
+    "/proc", "/proc/*", "/sys", "/sys/*", "/dev", "/dev/*", "/run", "/run/*",
+    "/etc/shadow", "/etc/gshadow", "/etc/ssh", "/etc/ssh/*", "/etc/ssl/private", "/etc/ssl/private/*",
+    "*/.ssh", "*/.ssh/*", "*/.gnupg", "*/.gnupg/*", "*/.aws", "*/.aws/*",
+    "*/.kube/config", "*.pem", "*.key", "*/.env", "*/.env.*",
+)
 
 
 def _load_json(path: Path) -> dict:
@@ -95,6 +118,150 @@ def _credentials(ref: str) -> dict:
         return _load_json(CREDENTIALS_FILE)[ref]
     except KeyError as exc:
         raise GatewayError("服务器凭据未配置") from exc
+
+
+def _is_under_root(path: str, root: str) -> bool:
+    return root == "/" or path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _validate_read_path(path: str | None, config: dict) -> str:
+    if not path or not path.startswith("/"):
+        raise GatewayError("请提供以 / 开头的绝对路径。")
+    if "\x00" in path or any(part in (".", "..") for part in path.split("/")):
+        raise GatewayError("路径不能包含 .、.. 或空字节。")
+    read_roots = config.get("read_roots", [])
+    if not any(_is_under_root(path, root.rstrip("/")) for root in read_roots):
+        raise GatewayError("该路径不在当前服务器允许读取的范围内。")
+    denied = tuple(config.get("denied_read_patterns", [])) + HARD_DENIED_PATHS
+    if any(fnmatch.fnmatch(path, pattern) for pattern in denied):
+        raise GatewayError("该路径属于敏感来源，AISSHBot 不会读取。")
+    return path
+
+
+def _path_guard_command(path: str, config: dict) -> str:
+    """Resolve remote symlinks and re-check roots before any file operation."""
+    quoted_path = shlex.quote(path)
+    roots = [root.rstrip("/") or "/" for root in config.get("read_roots", [])]
+    if "/" in roots:
+        root_check = ":"
+    else:
+        patterns = []
+        for root in roots:
+            patterns.extend((root, root + "/*"))
+        root_check = f"case \"$resolved\" in {'|'.join(patterns)}) ;; *) echo '__ERROR__|outside_read_root'; exit 2;; esac"
+    return (
+        f"resolved=$(readlink -f -- {quoted_path} 2>/dev/null) || {{ echo '__ERROR__|path_not_found'; exit 2; }}; "
+        f"{root_check}; "
+        "case \"$resolved\" in "
+        "/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/etc/shadow|/etc/gshadow|"
+        "/etc/ssh|/etc/ssh/*|/etc/ssl/private|/etc/ssl/private/*|*/.ssh|*/.ssh/*|*/.gnupg|*/.gnupg/*|"
+        "*/.aws|*/.aws/*|*/.kube/config|*.pem|*.key|*/.env|*/.env.*) "
+        "echo '__ERROR__|sensitive_path'; exit 2;; esac"
+    )
+
+
+def _pid_target(intent: OperationIntent) -> str:
+    if not intent.target or not re.fullmatch(r"[1-9]\d{1,8}", intent.target):
+        raise GatewayError("PID 必须是有效的纯数字。")
+    return intent.target
+
+
+def _process_detail_command(intent: OperationIntent) -> str:
+    pid = _pid_target(intent)
+    return (
+        f"if ps -p {pid} >/dev/null 2>&1; then "
+        "ps -p " + pid + " -o user=,pid=,ppid=,stat=,etime=,%cpu=,%mem=,comm=; "
+        "else echo '__MISSING__'; fi"
+    )
+
+
+def _java_log_sources_command(intent: OperationIntent) -> str:
+    if intent.target == "all":
+        # Keep each ps format as a separate -o option.  This works on the
+        # older procps version present on the Alibaba host as well.
+        pid_selector = "ps -e -o pid= -o comm= | awk '$2==\"java\" {print $1}'"
+    else:
+        pid_selector = f"printf '%s\\n' '{_pid_target(intent)}'"
+    return (
+        "echo '__JAVA_LOG_SOURCES__'; "
+        f"for pid in $({pid_selector}); do "
+        "if ps -p \"$pid\" -o comm= 2>/dev/null | grep -qx 'java'; then "
+        "printf '__PID__|%s\\n' \"$pid\"; "
+        "ps -p \"$pid\" -o user=,pid=,ppid=,stat=,etime=,%cpu=,%mem=,comm=; "
+        "for fd in /proc/\"$pid\"/fd/*; do p=$(readlink \"$fd\" 2>/dev/null || true); "
+        "case \"$p\" in *.log|*/logs/*) printf '%s\\n' \"$p\";; esac; done | sort -u | head -n 12; "
+        "fi; done"
+    )
+
+
+def _service_units(target: str | None) -> tuple[str, ...]:
+    units = SERVICE_UNITS.get(target or "")
+    if not units:
+        raise GatewayError("该服务不在允许查询的中间件清单中。")
+    return units
+
+
+def _service_status_command(target: str | None) -> str:
+    units = " ".join(shlex.quote(unit) for unit in _service_units(target))
+    return (
+        "echo '__SERVICES__'; "
+        f"for unit in {units}; do "
+        "active=$(systemctl is-active \"$unit\" 2>/dev/null || true); "
+        "enabled=$(systemctl is-enabled \"$unit\" 2>/dev/null || true); "
+        "pid=$(systemctl show \"$unit\" -p MainPID --value 2>/dev/null || true); "
+        "printf '%s|%s|%s|%s\\n' \"$unit\" \"${active:-unknown}\" \"${enabled:-unknown}\" \"${pid:-0}\"; "
+        "done"
+    )
+
+
+def _service_log_command(target: str | None, lines: int = 80) -> str:
+    units = " ".join(f"-u {shlex.quote(unit)}" for unit in _service_units(target))
+    return f"journalctl {units} --no-pager -n {lines} -o short-iso 2>&1 | tail -n {lines}"
+
+
+def _training_overview_command() -> str:
+    return (
+        "gpu_pids() { nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | "
+        "awk '{gsub(/ /, \"\"); if ($1 ~ /^[0-9]+$/) print $1}'; }; "
+        "project_rows() { gpu_pids | while read -r pid; do cwd=$(readlink -f \"/proc/$pid/cwd\" 2>/dev/null || true); "
+        "case \"$cwd\" in /home/uav|/home/uav/*) printf '%s|%s\\n' \"$pid\" \"$cwd\";; esac; done | sort -u; }; "
+        "training_files() { project_rows | while IFS='|' read -r pid cwd; do "
+        "find \"$cwd\" -xdev -maxdepth 5 -type f \\( -iname '*.log' -o -name 'results.csv' -o -name 'metrics*.csv' -o -name 'events.out.tfevents.*' \\) "
+        "! -path '*/.ssh/*' ! -name '.env' ! -name '.env.*' -size -50M -printf '%T@|%s|%p\\n' 2>/dev/null; done; }; "
+        "echo '__GPU__'; "
+        "if command -v nvidia-smi >/dev/null 2>&1; then "
+        "nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits; "
+        "else echo 'unavailable'; fi; "
+        "echo '__PROJECTS__'; project_rows; "
+        "echo '__RECENT_LOGS__'; "
+        "training_files | sort -nr | awk -F'|' '!seen[$3]++' | head -n 5; "
+        "latest=$(training_files | sort -nr | awk -F'|' '!seen[$3]++' | head -n 1); "
+        "if [ -n \"$latest\" ]; then record=${latest#*|}; path=${record#*|}; echo '__LATEST_LOG__'; printf 'path=%s\\n' \"$path\"; "
+        "stat -c 'modified=%y\\nsize=%s' \"$path\"; tail -n 120 \"$path\"; fi"
+    )
+
+
+def _file_list_command(path: str, config: dict) -> str:
+    return (
+        _path_guard_command(path, config)
+        + "; [ -d \"$resolved\" ] || { echo '__ERROR__|not_a_directory'; exit 2; }; "
+        "echo '__FILES__'; find \"$resolved\" -mindepth 1 -maxdepth 1 \\( -type f -o -type d \\) "
+        "-printf '%y|%s|%TY-%Tm-%Td %TH:%TM|%f\\n' 2>/dev/null | sort | head -n 80"
+    )
+
+
+def _file_preview_command(path: str, config: dict) -> str:
+    return (
+        _path_guard_command(path, config)
+        + "; [ -f \"$resolved\" ] && [ ! -L \"$resolved\" ] || { echo '__ERROR__|not_a_regular_file'; exit 2; }; "
+        "size=$(stat -c %s \"$resolved\" 2>/dev/null || echo 0); [ \"$size\" -le 2097152 ] || { echo '__ERROR__|file_too_large'; exit 2; }; "
+        "mime=$(file -b --mime-type \"$resolved\" 2>/dev/null || echo application/octet-stream); "
+        "case \"$mime\" in text/*|application/json|application/xml|application/x-yaml) ;; "
+        "*) case \"$resolved\" in *.py|*.pyw|*.sh|*.bash|*.conf|*.ini|*.yaml|*.yml|*.json|*.xml|*.properties|*.log|*.csv|*.tsv|*.txt|*.md) ;; "
+        "*) echo '__ERROR__|non_text_file'; exit 2;; esac;; esac; "
+        "echo '__META__'; printf 'path=%s\\nsize=%s\\nmime=%s\\n' \"$resolved\" \"$size\" \"$mime\"; "
+        "echo '__CONTENT__'; tail -n 60 \"$resolved\""
+    )
 
 
 def _run_local(command: str) -> tuple[int, str]:
@@ -325,7 +492,100 @@ def _format_gpu(name: str, raw: str) -> str:
     )
 
 
+def _format_gpu_processes(name: str, raw: str) -> str:
+    if "nvidia-smi=unavailable" in raw:
+        return f"【{name} · GPU 进程】当前服务器未提供 nvidia-smi。"
+    _, _, content = raw.partition("__GPU_PROCESSES__")
+    rows = []
+    for line in content.splitlines():
+        fields = line.split("|", 1)
+        if len(fields) != 2:
+            continue
+        gpu_memory, process = fields
+        values = process.split(maxsplit=7)
+        if len(values) != 8:
+            continue
+        user, pid, ppid, state, elapsed, cpu, memory, command = values
+        rows.append(
+            f"{command}（PID {pid}）\n"
+            f"  GPU 显存 {gpu_memory.strip()} MiB · CPU {cpu}% · 内存 {memory}% · 已运行 {elapsed}"
+        )
+    if not rows:
+        return f"【{name} · GPU 进程】当前没有检测到可见的计算进程。"
+    return f"【{name} · GPU 进程】共 {len(rows)} 个\n" + _mobile_items(rows[:8])
+
+
+def _format_process_detail(name: str, intent: OperationIntent, raw: str) -> str:
+    if "__MISSING__" in raw:
+        return f"【{name} · 进程】未找到 PID {intent.target}，它可能已经退出。"
+    values = raw.strip().split(maxsplit=7)
+    if len(values) != 8:
+        return f"【{name} · 进程】无法读取 PID {intent.target} 的状态。"
+    user, pid, ppid, state, elapsed, cpu, memory, command = values
+    state_text = "异常" if state.startswith(("D", "Z")) else "运行中"
+    return (
+        f"【{name} · PID {pid}】{state_text}\n"
+        + _mobile_items([
+            f"程序：{command}",
+            f"父进程：{ppid}",
+            f"CPU：{cpu}% · 内存：{memory}%",
+            f"运行时长：{elapsed}",
+        ])
+    )
+
+
+def _format_middleware(name: str, raw: str) -> str:
+    unit_part, _, process_part = raw.partition("__PROCESSES__")
+    _, _, unit_content = unit_part.partition("__UNITS__")
+    active = []
+    for line in unit_content.splitlines():
+        unit, *values = line.split("|")
+        if len(values) != 3:
+            continue
+        state, enabled, pid = values
+        if state == "active" or pid not in ("", "0"):
+            active.append(f"{unit}：{state or 'unknown'}（PID {pid or '0'}）")
+    processes = []
+    for line in process_part.splitlines()[:8]:
+        values = line.split(maxsplit=6)
+        if len(values) == 7:
+            pid, user, state, elapsed, cpu, memory, command = values
+            processes.append(f"{command}（PID {pid}，CPU {cpu}%）")
+    if not active and not processes:
+        return f"【{name} · 中间件】未检测到 Nginx、MySQL、MQTT、Redis 或 Docker 服务。"
+    blocks = []
+    if active:
+        blocks.append("服务状态\n" + _mobile_items(active[:8]))
+    if processes:
+        blocks.append("相关进程\n" + _mobile_items(processes))
+    return f"【{name} · 中间件概览】\n" + "\n\n".join(blocks)
+
+
+def _parse_service_records(raw: str) -> list[tuple[str, str, str, str]]:
+    _, marker, content = raw.partition("__SERVICES__")
+    source = content if marker else raw
+    records = []
+    for line in source.splitlines():
+        values = line.split("|")
+        if len(values) == 4:
+            records.append(tuple(value.strip() for value in values))
+    return records
+
+
 def _format_service_status(name: str, target: str, raw: str) -> str:
+    records = _parse_service_records(raw)
+    if records:
+        lines = []
+        for unit, active, enabled, pid in records:
+            if active == "active":
+                status = "运行中"
+            elif active in ("unknown", "not-found", ""):
+                status = "未运行或未安装"
+            else:
+                status = active
+            startup = "未配置" if enabled in ("unknown", "not-found", "") else enabled
+            lines.append(f"{unit}：{status}\n  开机启动 {startup} · PID {pid or '0'}")
+        return f"【{name} · {target}】\n" + _mobile_items(lines)
     values, _ = _kv_and_rows(raw, marker="__NEVER__")
     active = values.get("active") or "unknown"
     enabled = values.get("enabled") or "unknown"
@@ -358,6 +618,197 @@ def _format_logs(name: str, target: str, raw: str) -> str:
     return f"【{name} · {target}最近日志】\n" + "\n".join(f"- {line}" for line in lines)
 
 
+_ERROR_PATTERN = re.compile(r"(?i)(error|exception|fatal|oom|outofmemory|failed|timeout|拒绝|错误|异常)")
+
+
+def _format_service_errors(name: str, target: str, raw: str) -> str:
+    matches = []
+    for line in raw.splitlines():
+        clean = _SECRET_PATTERN.sub(r"\1\2<redacted>", line.strip())[:220]
+        if clean and _ERROR_PATTERN.search(clean):
+            matches.append(clean)
+    if not matches:
+        return f"【{name} · {target}错误摘要】最近采样日志中未发现 ERROR、Exception、OOM、Failed 或 Timeout。"
+    recent = matches[-5:]
+    return (
+        f"【{name} · {target}错误摘要】发现 {len(matches)} 条可疑日志\n"
+        + "\n".join(f"- {line}" for line in recent)
+        + "\n\n说明：这是日志关键词诊断，不等同于服务已不可用。"
+    )
+
+
+def _format_training_overview(name: str, raw: str) -> str:
+    gpu_part, _, remainder = raw.partition("__PROJECTS__")
+    project_part, _, remainder = remainder.partition("__RECENT_LOGS__")
+    logs_part, _, latest_part = remainder.partition("__LATEST_LOG__")
+    gpu_rows = []
+    for line in gpu_part.splitlines():
+        values = [value.strip() for value in line.split(",")]
+        if len(values) == 4:
+            index, util, used, total = values
+            gpu_rows.append(f"GPU {index}：{util}% · {_as_float(used) / 1024:.1f} / {_as_float(total) / 1024:.1f} GB")
+    candidates = []
+    for line in logs_part.splitlines()[:5]:
+        values = line.split("|", 2)
+        if len(values) == 3:
+            _, size, path = values
+            candidates.append(f"{Path(path).name}（{_as_int(size) / 1024:.0f} KB）")
+
+    projects = []
+    for line in project_part.splitlines():
+        values = line.split("|", 1)
+        if len(values) == 2:
+            pid, cwd = values
+            projects.append(f"PID {pid}：{cwd}")
+
+    metric_lines = latest_part.splitlines()
+    metadata = {}
+    content = []
+    in_content = False
+    for line in metric_lines:
+        if line.startswith(("path=", "modified=", "size=")) and not in_content:
+            key, value = line.split("=", 1)
+            metadata[key] = value
+        else:
+            in_content = True
+            content.append(line)
+    joined = "\n".join(content)
+    patterns = {
+        "Epoch": r"(?i)epoch\s*[:=]?\s*(\d+)\s*(?:/|of)\s*(\d+)?",
+        "Step": r"(?i)(?:global_)?step\s*[:=]?\s*(\d+)",
+        "Loss": r"(?i)(?:train[_ ]?)?loss\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)",
+        "Episode": r"(?i)episode\s*[:=]?\s*(\d+)",
+        "Success": r"(?i)success[_ ]?rate\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)",
+    }
+    facts = []
+    for label, pattern in patterns.items():
+        found = re.findall(pattern, joined)
+        if found:
+            value = found[-1]
+            facts.append(f"{label}：{' / '.join(value) if isinstance(value, tuple) else value}")
+    csv_rows = []
+    try:
+        parsed_rows = list(csv.reader(io.StringIO(joined)))
+        header_index = next(
+            (index for index, row in enumerate(parsed_rows) if row and row[0].strip().lower() == "epoch"),
+            None,
+        )
+        if header_index is not None:
+            header = [column.strip() for column in parsed_rows[header_index]]
+            data_rows = [row for row in parsed_rows[header_index + 1:] if row and row[0].strip().isdigit()]
+            if data_rows:
+                latest = data_rows[-1]
+                values = dict(zip(header, latest))
+                csv_rows.append(f"Epoch：{latest[0].strip()}")
+                for column, label in (
+                    ("train/box_loss", "Box Loss"),
+                    ("train/cls_loss", "Cls Loss"),
+                    ("metrics/mAP50(B)", "mAP50"),
+                    ("metrics/mAP50-95(B)", "mAP50-95"),
+                ):
+                    if values.get(column, "").strip():
+                        csv_rows.append(f"{label}：{values[column].strip()}")
+    except (csv.Error, ValueError):
+        csv_rows = []
+    if csv_rows:
+        facts = csv_rows
+    errors = len(_ERROR_PATTERN.findall(joined))
+    blocks = []
+    if gpu_rows:
+        blocks.append("GPU\n" + _mobile_items(gpu_rows))
+    if projects:
+        blocks.append("GPU 任务工作目录\n" + _mobile_items(projects[:4]))
+    if facts:
+        blocks.append("最新训练指标\n" + _mobile_items(facts))
+    if metadata.get("path"):
+        blocks.append(f"最近训练日志：{Path(metadata['path']).name}\n更新时间：{metadata.get('modified', '未知')}")
+    elif candidates:
+        blocks.append("最近发现的训练日志\n" + _mobile_items(candidates))
+    if errors:
+        blocks.append(f"风险提示：最近日志片段匹配到 {errors} 个错误关键词，建议进一步查看具体日志。")
+    if not blocks:
+        return f"【{name} · 训练概览】未发现 GPU 数据或可识别的训练日志。"
+    return f"【{name} · 训练概览】\n" + "\n\n".join(blocks) + "\n\n说明：未登记项目规则时，只能识别通用 Epoch、Step、Loss，不能保证代表全部训练任务。"
+
+
+def _format_file_list(name: str, intent: OperationIntent, raw: str) -> str:
+    if "__ERROR__" in raw:
+        return _format_file_error(name, intent.target, raw)
+    _, _, content = raw.partition("__FILES__")
+    rows = []
+    for line in content.splitlines()[:40]:
+        kind, size, modified, filename = (line.split("|", 3) + ["", "", "", ""])[:4]
+        if not filename:
+            continue
+        kind_text = "目录" if kind == "d" else "文件"
+        size_text = "" if kind == "d" else f" · {_as_int(size) / 1024:.0f} KB"
+        rows.append(f"{kind_text}：{filename}{size_text}\n  修改时间 {modified}")
+    if not rows:
+        return f"【{name} · 文件目录】目录为空或没有可显示的普通文件。"
+    suffix = "\n… 已限制显示前 40 项。" if len(content.splitlines()) > 40 else ""
+    return f"【{name} · 文件目录】{intent.target}\n" + _mobile_items(rows) + suffix
+
+
+def _format_file_error(name: str, path: str | None, raw: str) -> str:
+    code = raw.rsplit("|", 1)[-1].strip()
+    messages = {
+        "path_not_found": "路径不存在。",
+        "outside_read_root": "路径不在允许读取范围内。",
+        "sensitive_path": "该路径包含敏感数据，已拒绝读取。",
+        "not_a_directory": "目标不是目录。",
+        "not_a_regular_file": "目标不是普通文件。",
+        "file_too_large": "文件超过 2 MB 预览上限。",
+        "non_text_file": "只支持文本、JSON、XML 或 YAML 文件预览。",
+    }
+    return f"【{name} · 文件查询】{messages.get(code, '该文件查询无法执行。')}"
+
+
+def _format_file_preview(name: str, intent: OperationIntent, raw: str) -> str:
+    if "__ERROR__" in raw:
+        return _format_file_error(name, intent.target, raw)
+    meta_part, _, content = raw.partition("__CONTENT__")
+    metadata, _ = _kv_and_rows(meta_part, marker="__NEVER__")
+    lines = []
+    for line in content.splitlines()[-40:]:
+        clean = _SECRET_PATTERN.sub(r"\1\2<redacted>", line.strip())[:220]
+        if clean:
+            lines.append(clean)
+    header = (
+        f"【{name} · 文件预览】{Path(metadata.get('path', intent.target or '')).name}\n"
+        f"大小：{_as_int(metadata.get('size')) / 1024:.0f} KB · 类型：{metadata.get('mime', '未知')}"
+    )
+    return header + ("\n\n最后内容\n" + "\n".join(f"- {line}" for line in lines) if lines else "\n\n文件为空。")
+
+
+def _format_java_log_sources(name: str, intent: OperationIntent, raw: str) -> str:
+    if "__PID__|" not in raw:
+        target = "Java 进程" if intent.target == "all" else f"Java PID {intent.target}"
+        return f"【{name} · Java 日志】未找到正在运行的{target}。"
+    lines = raw.splitlines()
+    blocks: list[tuple[str, list[str]]] = []
+    current_pid: str | None = None
+    current_paths: list[str] = []
+    for line in lines:
+        if line.startswith("__PID__|"):
+            if current_pid is not None:
+                blocks.append((current_pid, current_paths))
+            current_pid = line.split("|", 1)[1].strip()
+            current_paths = []
+        elif current_pid is not None:
+            clean = line.strip()
+            if clean and clean.startswith("/"):
+                current_paths.append(clean)
+    if current_pid is not None:
+        blocks.append((current_pid, current_paths))
+    sections = []
+    for pid, paths in blocks:
+        if paths:
+            sections.append(f"• PID {pid}\n" + "\n".join(f"  - {path}" for path in paths[:12]))
+        else:
+            sections.append(f"• PID {pid}\n  - 未从已打开文件描述符发现日志路径")
+    return f"【{name} · Java 日志来源】\n" + "\n\n".join(sections)
+
+
 def _format_inventory(visible_server_ids: list[str]) -> str:
     servers = _load_json(SERVERS_FILE)
     rows = []
@@ -375,13 +826,31 @@ def _format_inventory(visible_server_ids: list[str]) -> str:
     )
 
 
-def _command_for(intent: OperationIntent) -> str:
+def _command_for(intent: OperationIntent, config: dict | None = None) -> str:
     if intent.operation in READONLY_COMMANDS:
         return READONLY_COMMANDS[intent.operation]
-    if intent.operation == "service_status" and intent.target in SERVICE_STATUS_COMMANDS:
-        return SERVICE_STATUS_COMMANDS[intent.target]
-    if intent.operation == "service_logs" and intent.target in SERVICE_LOG_COMMANDS:
-        return SERVICE_LOG_COMMANDS[intent.target]
+    if intent.operation == "process_detail":
+        return _process_detail_command(intent)
+    if intent.operation == "java_log_sources":
+        return _java_log_sources_command(intent)
+    if intent.operation == "training_overview":
+        if intent.server_id != "server1":
+            raise GatewayError("训练概览目前仅在 AI GPU服务器1 开放。")
+        return _training_overview_command()
+    if intent.operation == "service_status":
+        return _service_status_command(intent.target)
+    if intent.operation == "service_logs":
+        return _service_log_command(intent.target, lines=30)
+    if intent.operation == "service_errors":
+        return _service_log_command(intent.target, lines=240)
+    if intent.operation == "file_list":
+        if config is None:
+            raise GatewayError("文件查询缺少服务器配置。")
+        return _file_list_command(_validate_read_path(intent.target, config), config)
+    if intent.operation == "file_preview":
+        if config is None:
+            raise GatewayError("文件查询缺少服务器配置。")
+        return _file_preview_command(_validate_read_path(intent.target, config), config)
     raise GatewayError("该操作或目标不在只读白名单中")
 
 
@@ -395,12 +864,28 @@ def _format_result(intent: OperationIntent, config: dict, code: int, raw: str) -
         return _format_processes(name, raw, intent.detail)
     if intent.operation == "java_status":
         return _format_java(name, raw)
-    if intent.operation == "paper_progress":
+    if intent.operation == "gpu_overview":
         return _format_gpu(name, raw)
+    if intent.operation == "gpu_processes":
+        return _format_gpu_processes(name, raw)
+    if intent.operation == "process_detail":
+        return _format_process_detail(name, intent, raw)
+    if intent.operation == "training_overview":
+        return _format_training_overview(name, raw)
+    if intent.operation == "middleware_overview":
+        return _format_middleware(name, raw)
+    if intent.operation == "java_log_sources":
+        return _format_java_log_sources(name, intent, raw)
     if intent.operation == "service_status" and intent.target:
         return _format_service_status(name, intent.target, raw)
     if intent.operation == "service_logs" and intent.target:
         return _format_logs(name, intent.target, raw)
+    if intent.operation == "service_errors" and intent.target:
+        return _format_service_errors(name, intent.target, raw)
+    if intent.operation == "file_list":
+        return _format_file_list(name, intent, raw)
+    if intent.operation == "file_preview":
+        return _format_file_preview(name, intent, raw)
     raise GatewayError("没有对应的结果格式化器")
 
 
@@ -409,19 +894,19 @@ async def execute_readonly(
     actor_id: str,
     visible_server_ids: list[str],
 ) -> str:
-    if intent.server_id not in visible_server_ids:
-        write_denied_audit(intent, actor_id)
-        raise GatewayError("服务器不在当前用户的授权范围内")
     if intent.operation == "inventory":
         _write_audit(intent, actor_id, "success", 0)
         return _format_inventory(visible_server_ids)
+    if intent.server_id not in visible_server_ids:
+        write_denied_audit(intent, actor_id)
+        raise GatewayError("服务器不在当前用户的授权范围内")
     if intent.operation == "select_server":
         config = _server_config(intent.server_id)
         _write_audit(intent, actor_id, "success", 0)
         return f"已切换到【{config['name']}】。后续未指定服务器时默认查询它。"
 
-    command = _command_for(intent)
     config = _server_config(intent.server_id)
+    command = _command_for(intent, config)
     try:
         if config["transport"] == "local":
             code, raw = await asyncio.to_thread(_run_local, command)

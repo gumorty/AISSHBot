@@ -1,4 +1,4 @@
-"""Rule-first intent detection for safe, structured server operations."""
+"""Rule-first intent detection for safe, structured server diagnostics."""
 
 from __future__ import annotations
 
@@ -11,17 +11,38 @@ SAFE_OPERATIONS = (
     "select_server",
     "health",
     "processes",
-    "paper_progress",
+    "process_detail",
+    "gpu_overview",
+    "gpu_processes",
+    "training_overview",
     "java_status",
+    "java_log_sources",
+    "middleware_overview",
     "service_status",
     "service_logs",
+    "service_errors",
+    "file_list",
+    "file_preview",
 )
 
 SERVICE_ALIASES = {
     "nginx": "nginx",
     "docker": "docker",
     "docker服务": "docker",
+    "mysql": "mysql",
+    "mysqld": "mysql",
+    "mariadb": "mysql",
+    "mqtt": "mqtt",
+    "mosquitto": "mqtt",
+    "emqx": "mqtt",
+    "redis": "redis",
+    "redis-server": "redis",
 }
+
+# Keep Chinese sentence text after a path out of the target, e.g.
+# `/home/uav/a.py内容` should resolve to `/home/uav/a.py`.
+_PATH_RE = re.compile(r"(?P<path>/[A-Za-z0-9._~:/@%+\-]+)")
+_PID_RE = re.compile(r"(?:pid\s*[=:：#-]?\s*)?(?<!\d)([1-9]\d{1,8})(?!\d)", re.I)
 
 
 @dataclass(frozen=True)
@@ -48,12 +69,27 @@ def _service_from_text(value: str) -> str | None:
     return None
 
 
+def _path_from_text(message: str) -> str | None:
+    match = _PATH_RE.search(message or "")
+    if not match:
+        return None
+    return match.group("path").rstrip("/，。；、！？?：:,.!") or "/"
+
+
+def _pid_from_text(message: str) -> str | None:
+    match = _PID_RE.search(message or "")
+    return match.group(1) if match else None
+
+
 def detect_intent(message: str, default_server_id: str | None = None) -> OperationIntent | None:
-    value = re.sub(r"\s+", "", message or "").lower()
+    raw_message = message or ""
+    value = re.sub(r"\s+", "", raw_message).lower()
     if not value:
         return None
 
     server_id, assumed = _server_from_text(value, default_server_id)
+    path = _path_from_text(raw_message)
+    pid = _pid_from_text(raw_message)
 
     inventory_phrases = (
         "有哪些服务器", "有什么服务器", "哪些服务器", "服务器列表", "可用服务器",
@@ -66,18 +102,36 @@ def detect_intent(message: str, default_server_id: str | None = None) -> Operati
     if not assumed and any(word in value for word in ("切换", "选择", "连接", "使用", "设为默认")):
         return OperationIntent("select_server", server_id, False)
 
+    if path and any(word in value for word in ("列出", "目录", "文件夹", "有哪些文件", "文件列表")):
+        return OperationIntent("file_list", server_id, assumed, target=path)
+    if path and any(word in value for word in ("查看", "读取", "内容", "最后", "tail", "日志")):
+        return OperationIntent("file_preview", server_id, assumed, target=path)
+
+    service = _service_from_text(value)
+    if service and any(word in value for word in ("报错", "错误", "异常", "error", "exception", "失败")):
+        return OperationIntent("service_errors", server_id, assumed, target=service)
+    if service and any(word in value for word in ("日志", "log", "记录")):
+        return OperationIntent("service_logs", server_id, assumed, target=service)
+    if service and any(word in value for word in ("状态", "运行", "正常", "是否启动", "在不在")):
+        return OperationIntent("service_status", server_id, assumed, target=service)
+
+    if "java" in value and any(word in value for word in ("日志", "log", "文件")):
+        return OperationIntent("java_log_sources", server_id, assumed, target=pid or "all")
     if "java" in value and any(word in value for word in ("进程", "运行", "状态", "异常", "服务", "正常")):
         return OperationIntent("java_status", server_id, assumed, target="java")
 
-    service = _service_from_text(value)
-    if service and any(word in value for word in ("日志", "报错", "错误记录")):
-        return OperationIntent("service_logs", server_id, assumed, target=service)
-    if service and any(word in value for word in ("状态", "运行", "正常", "异常", "是否启动", "在不在")):
-        return OperationIntent("service_status", server_id, assumed, target=service)
+    if any(word in value for word in ("中间件", "运行的服务", "服务列表", "mysql", "mqtt", "nginx", "redis")):
+        return OperationIntent("middleware_overview", server_id, assumed)
 
-    if any(word in value for word in ("论文", "训练", "实验", "gpu", "显卡", "epoch", "loss", "step", "进展")):
-        return OperationIntent("paper_progress", server_id, assumed)
+    if any(word in value for word in ("gpu进程", "显卡进程", "占用gpu的进程", "gpu上的进程")):
+        return OperationIntent("gpu_processes", server_id, assumed)
+    if any(word in value for word in ("论文", "训练", "实验", "epoch", "loss", "step", "训练进度", "训练情况")):
+        return OperationIntent("training_overview", server_id, assumed)
+    if any(word in value for word in ("gpu", "显卡", "nvidia-smi")):
+        return OperationIntent("gpu_overview", server_id, assumed)
 
+    if pid and any(word in value for word in ("进程", "pid", "详情", "状态", "在干什么")):
+        return OperationIntent("process_detail", server_id, assumed, target=pid)
     if any(word in value for word in ("进程", "任务", "运行什么", "运行哪些")):
         if any(word in value for word in ("几个", "多少", "数量", "总数")):
             detail = "count"
@@ -94,14 +148,18 @@ def detect_intent(message: str, default_server_id: str | None = None) -> Operati
 
 
 def llm_planner_prompt(message: str, visible_servers: list[str], context_summary: str = "") -> str:
-    """Fallback contract; excludes credentials, command strings and command output."""
+    """Fallback contract; it excludes credentials, paths and command output."""
+    fallback_operations = [
+        "inventory", "select_server", "health", "processes", "gpu_overview",
+        "training_overview", "java_status", "middleware_overview",
+    ]
     return (
-        "你是 AISSHBot 的受限意图规划器。只能选择 operation、server_id、target 和 detail，"
+        "你是 AISSHBot 的受限意图规划器。只能选择 operation、server_id 和 detail；"
         "绝不输出 shell 命令、路径、账号、密码或执行步骤。\n"
-        f"允许操作：{list(SAFE_OPERATIONS)}；允许服务器：{visible_servers}。\n"
-        "target 只允许 nginx、docker 或 null；detail 只允许 count、summary、detail。\n"
+        f"允许操作：{fallback_operations}；允许服务器：{visible_servers}。\n"
+        "detail 只允许 count、summary、detail。\n"
         f"本地会话上下文：{context_summary or '无'}。\n"
         "只输出 JSON：{\"operation\":\"...\",\"server_id\":\"...\","
-        "\"target\":null,\"detail\":\"summary\",\"confidence\":0.0}。\n"
+        "\"detail\":\"summary\",\"confidence\":0.0}。\n"
         f"用户消息：{message!r}"
     )

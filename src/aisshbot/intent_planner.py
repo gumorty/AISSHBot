@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-from .intent import OperationIntent, SAFE_OPERATIONS, detect_intent, llm_planner_prompt
+from .intent import OperationIntent, detect_intent, llm_planner_prompt
 from .memory import SessionContext
 
 
@@ -87,9 +87,13 @@ async def _llm_plan(
         confidence = float(payload.get("confidence", 0.0))
     except (TypeError, ValueError):
         confidence = 0.0
-    if operation not in SAFE_OPERATIONS or server_id not in allowed or confidence < 0.6:
+    fallback_operations = {
+        "inventory", "select_server", "health", "processes", "gpu_overview",
+        "training_overview", "java_status", "middleware_overview",
+    }
+    if operation not in fallback_operations or server_id not in allowed or confidence < 0.6:
         return None
-    if target not in (None, "nginx", "docker"):
+    if target is not None:
         return None
     if detail not in ("count", "summary", "detail"):
         detail = "summary"

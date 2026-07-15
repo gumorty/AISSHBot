@@ -6,8 +6,8 @@
       "display_name": "管理员",
       "identities": [{"platform": "openclaw-weixin", "external_id": "person_example@im.wechat"}],
       "grants": {
-        "server1": {"operations": ["inventory", "health", "processes", "paper_progress", "java_status", "service_status", "service_logs"]},
-        "server2": {"operations": ["inventory", "health", "processes", "java_status", "service_status", "service_logs"]}
+        "server1": {"operations": ["inventory", "health", "processes", "process_detail", "gpu_overview", "gpu_processes", "training_overview", "java_status", "java_log_sources", "middleware_overview", "service_status", "service_logs", "service_errors", "file_list", "file_preview"]},
+        "server2": {"operations": ["inventory", "health", "processes", "process_detail", "java_status", "java_log_sources", "middleware_overview", "service_status", "service_logs", "service_errors", "file_list", "file_preview"]}
       }
     }
   ]

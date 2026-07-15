@@ -8,8 +8,11 @@ from aisshbot.memory import ShortTermMemory
 from aisshbot.ops_gateway import (
     GatewayError,
     _command_for,
+    _format_file_preview,
+    _format_gpu_processes,
     _format_gpu,
     _format_health,
+    _format_java_log_sources,
     _format_processes,
     _format_service_status,
 )
@@ -27,7 +30,7 @@ def test_short_term_memory_inherits_server_and_isolates_users():
 
     inherited = memory.apply("alice", detect_intent("那它的GPU呢？"), "那它的GPU呢？")
     assert inherited.server_id == "server2"
-    assert inherited.operation == "paper_progress"
+    assert inherited.operation == "gpu_overview"
 
     follow_up = memory.apply("alice", None, "有异常吗？")
     assert follow_up.server_id == "server2"
@@ -103,7 +106,7 @@ disk_pct=50%
     assert "内存：16.0 / 32.0 GB（50%）" in output
     assert "结论：资源状态正常" in output
 
-    assert "systemctl is-active nginx" in _command_for(
+    assert "systemctl is-active \"$unit\"" in _command_for(
         OperationIntent("service_status", "server1", target="nginx")
     )
     service = _format_service_status(
@@ -115,3 +118,59 @@ disk_pct=50%
     assert "开机启动 disabled" in service
     with pytest.raises(GatewayError):
         _command_for(OperationIntent("service_status", "server1", target="nginx;id"))
+
+
+def test_deep_diagnostics_intents_and_safe_file_access():
+    assert detect_intent("服务器1占用GPU的进程是哪两个").operation == "gpu_processes"
+    assert detect_intent("训练进度怎么样").operation == "training_overview"
+    assert detect_intent("查看 /home/uav/project/train.log 最后内容").operation == "file_preview"
+    assert detect_intent("列出 /home/uav/project 的文件").operation == "file_list"
+    assert detect_intent("Java日志有没有").operation == "java_log_sources"
+    assert detect_intent("Java日志有没有").target == "all"
+    assert detect_intent("查看/home/uav/train.py内容").target == "/home/uav/train.py"
+
+    config = {
+        "read_roots": ["/home/uav"],
+        "denied_read_patterns": ["/home/uav/**/.ssh/*"],
+    }
+    command = _command_for(OperationIntent("file_preview", "server1", target="/home/uav/project/train.log"), config)
+    assert "tail -n 60" in command
+    assert "/home/uav/project/train.log" in command
+    with pytest.raises(GatewayError):
+        _command_for(OperationIntent("file_preview", "server1", target="/home/uav/../etc/shadow"), config)
+    with pytest.raises(GatewayError):
+        _command_for(OperationIntent("file_preview", "server1", target="/home/uav/.ssh/id_rsa"), config)
+
+
+def test_gpu_process_and_file_preview_redact_secrets():
+    gpu = _format_gpu_processes(
+        "AI GPU服务器1",
+        "__GPU_PROCESSES__\n19298|uav 258292 1 Sl 01:12:20 89.4 1.9 python\n",
+    )
+    assert "python（PID 258292）" in gpu
+    assert "GPU 显存 19298 MiB" in gpu
+
+    preview = _format_file_preview(
+        "AI GPU服务器1",
+        OperationIntent("file_preview", "server1", target="/home/uav/project/train.log"),
+        "__META__\npath=/home/uav/project/train.log\nsize=200\nmime=text/plain\n__CONTENT__\ntoken=abc123\nEpoch 2/10 loss=0.12\n",
+    )
+    assert "token=<redacted>" in preview
+    assert "Epoch 2/10" in preview
+
+
+def test_java_log_sources_supports_all_running_java_processes():
+    output = _format_java_log_sources(
+        "阿里云服务器",
+        OperationIntent("java_log_sources", "server2", target="all"),
+        "__JAVA_LOG_SOURCES__\n"
+        "__PID__|10984\n"
+        "root 10984 1 Sl 2-03:19:12 0.2 19.9 java\n"
+        "/opt/sensor-stack/test-yudao/logs/startup.log\n"
+        "__PID__|25252\n"
+        "root 25252 1 Sl 40-01:00:00 0.1 8.0 java\n"
+        "/data/sensor/logs/yudao-server.log\n",
+    )
+    assert "PID 10984" in output
+    assert "PID 25252" in output
+    assert "startup.log" in output
