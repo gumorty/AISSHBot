@@ -10,11 +10,11 @@
 → 精简格式化 / 审计 → 微信回复
 ```
 
-LLM 只能在本地规则不能确定时，从固定的 `inventory`、`select_server`、`health`、`processes`、`process_detail`、`gpu_overview`、`training_overview`、`java_status`、`middleware_overview` 中选择工具和已授权资产；路径、PID、服务名等动态目标由本地规则校验，LLM 不会获得 SSH 凭据，也不能生成 Shell 命令。
+LLM 只能在本地规则不能确定时，从固定的 `inventory`、`select_server`、`health`、`processes`、`process_detail`、`process_training`、`gpu_overview`、`training_overview`、`java_status`、`middleware_overview` 中选择工具和已授权资产；路径、PID、服务名等动态目标由本地规则校验，LLM 不会获得 SSH 凭据，也不能生成 Shell 命令。
 
 每个内部用户拥有独立的 30 分钟短期上下文，最多保留 6 轮，用于理解“那它呢”“再看一下进程”等追问。上下文只存在于 AISSHBot 进程内，不跨用户共享，服务重启后自动清空。
 
-当前响应会先提取数量、异常状态和关键指标，再输出适合手机聊天窗口的短分组和项目符号；不会直接返回完整命令行、环境变量或无限制日志。训练查询可从 GPU 任务工作目录中读取受控的 `results.csv`、指标 CSV、TensorBoard 事件和日志摘要；Java/中间件查询可查看进程、服务状态、日志来源和错误摘要。
+当前响应会先提取数量、异常状态和关键指标，再输出适合手机聊天窗口的短分组和项目符号；不会直接返回完整命令行、环境变量或无限制日志。训练查询可按当前 GPU 任务、指定 PID 或指定目录读取受控的 `results.csv`、`args.yaml`、模型/图片产物和日志摘要，并计算当前轮次、完成度、最佳指标和最近趋势；Java/中间件查询可查看进程、服务状态、日志来源和错误摘要。
 
 ## 安全边界
 

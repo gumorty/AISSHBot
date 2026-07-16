@@ -38,6 +38,16 @@ def _context_summary(context: SessionContext | None) -> str:
         parts.append(f"上次操作={context.last_operation}")
     if context.last_target:
         parts.append(f"上次目标={context.last_target}")
+    if context.last_pid:
+        parts.append(f"上次PID={context.last_pid}")
+    if context.last_path:
+        parts.append(f"上次路径={context.last_path}")
+    if context.last_training_run:
+        parts.append(f"上次训练实验={context.last_training_run}")
+    if context.last_artifact:
+        parts.append(f"上次文件={context.last_artifact}")
+    if context.last_service:
+        parts.append(f"上次服务={context.last_service}")
     for turn in context.turns[-2:]:
         question = re.sub(r"\s+", " ", turn.question).strip()[:96]
         if question:

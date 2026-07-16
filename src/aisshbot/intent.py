@@ -12,6 +12,7 @@ SAFE_OPERATIONS = (
     "health",
     "processes",
     "process_detail",
+    "process_training",
     "gpu_overview",
     "gpu_processes",
     "training_overview",
@@ -21,6 +22,7 @@ SAFE_OPERATIONS = (
     "service_status",
     "service_logs",
     "service_errors",
+    "path_inspect",
     "file_list",
     "file_preview",
 )
@@ -52,6 +54,8 @@ class OperationIntent:
     assumed_server: bool = False
     target: str | None = None
     detail: str = "summary"
+    target_type: str | None = None
+    output_mode: str = "text"
 
 
 def _server_from_text(value: str, default_server_id: str | None) -> tuple[str, bool]:
@@ -81,6 +85,13 @@ def _pid_from_text(message: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _training_words(value: str) -> bool:
+    return any(word in value for word in (
+        "论文", "训练", "实验", "epoch", "loss", "step", "训练进度", "训练情况",
+        "模型", "指标", "map50", "map50-95", "最佳", "权重", "曲线",
+    ))
+
+
 def detect_intent(message: str, default_server_id: str | None = None) -> OperationIntent | None:
     raw_message = message or ""
     value = re.sub(r"\s+", "", raw_message).lower()
@@ -102,23 +113,41 @@ def detect_intent(message: str, default_server_id: str | None = None) -> Operati
     if not assumed and any(word in value for word in ("切换", "选择", "连接", "使用", "设为默认")):
         return OperationIntent("select_server", server_id, False)
 
+    # A PID plus training language is a domain query, not a generic process
+    # detail query.  Resolve it before path/file rules so a script path in the
+    # same sentence cannot hide the training request.
+    if pid and _training_words(value):
+        return OperationIntent(
+            "process_training", server_id, assumed, target=pid, target_type="pid", detail="summary"
+        )
+
+    if path and _training_words(value):
+        return OperationIntent(
+            "training_overview", server_id, assumed, target=path, target_type="path", detail="summary"
+        )
+
     if path and any(word in value for word in ("列出", "目录", "文件夹", "有哪些文件", "文件列表")):
-        return OperationIntent("file_list", server_id, assumed, target=path)
+        return OperationIntent("file_list", server_id, assumed, target=path, target_type="path")
     if path and any(word in value for word in ("查看", "读取", "内容", "最后", "tail", "日志")):
-        return OperationIntent("file_preview", server_id, assumed, target=path)
+        return OperationIntent("file_preview", server_id, assumed, target=path, target_type="path")
+    if path:
+        return OperationIntent("path_inspect", server_id, assumed, target=path, target_type="path")
 
     service = _service_from_text(value)
     if service and any(word in value for word in ("报错", "错误", "异常", "error", "exception", "失败")):
-        return OperationIntent("service_errors", server_id, assumed, target=service)
+        return OperationIntent("service_errors", server_id, assumed, target=service, target_type="service")
     if service and any(word in value for word in ("日志", "log", "记录")):
-        return OperationIntent("service_logs", server_id, assumed, target=service)
+        return OperationIntent("service_logs", server_id, assumed, target=service, target_type="service")
     if service and any(word in value for word in ("状态", "运行", "正常", "是否启动", "在不在")):
-        return OperationIntent("service_status", server_id, assumed, target=service)
+        return OperationIntent("service_status", server_id, assumed, target=service, target_type="service")
 
     if "java" in value and any(word in value for word in ("日志", "log", "文件")):
-        return OperationIntent("java_log_sources", server_id, assumed, target=pid or "all")
+        return OperationIntent(
+            "java_log_sources", server_id, assumed, target=pid or "all",
+            target_type="pid" if pid else "process_group",
+        )
     if "java" in value and any(word in value for word in ("进程", "运行", "状态", "异常", "服务", "正常")):
-        return OperationIntent("java_status", server_id, assumed, target="java")
+        return OperationIntent("java_status", server_id, assumed, target="java", target_type="process_group")
 
     if any(word in value for word in ("中间件", "运行的服务", "服务列表", "mysql", "mqtt", "nginx", "redis")):
         return OperationIntent("middleware_overview", server_id, assumed)
@@ -126,12 +155,12 @@ def detect_intent(message: str, default_server_id: str | None = None) -> Operati
     if any(word in value for word in ("gpu进程", "显卡进程", "占用gpu的进程", "gpu上的进程")):
         return OperationIntent("gpu_processes", server_id, assumed)
     if any(word in value for word in ("论文", "训练", "实验", "epoch", "loss", "step", "训练进度", "训练情况")):
-        return OperationIntent("training_overview", server_id, assumed)
+        return OperationIntent("training_overview", server_id, assumed, target_type="current_run")
     if any(word in value for word in ("gpu", "显卡", "nvidia-smi")):
         return OperationIntent("gpu_overview", server_id, assumed)
 
     if pid and any(word in value for word in ("进程", "pid", "详情", "状态", "在干什么")):
-        return OperationIntent("process_detail", server_id, assumed, target=pid)
+        return OperationIntent("process_detail", server_id, assumed, target=pid, target_type="pid")
     if any(word in value for word in ("进程", "任务", "运行什么", "运行哪些")):
         if any(word in value for word in ("几个", "多少", "数量", "总数")):
             detail = "count"

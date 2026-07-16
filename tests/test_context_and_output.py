@@ -13,10 +13,13 @@ from aisshbot.ops_gateway import (
     _format_gpu,
     _format_health,
     _format_java_log_sources,
+    _format_path_inspect,
+    _format_process_training,
     _format_processes,
     _format_service_status,
 )
 from aisshbot.router import classify
+from aisshbot.training import analyze_results_csv
 
 
 def test_short_term_memory_inherits_server_and_isolates_users():
@@ -35,6 +38,23 @@ def test_short_term_memory_inherits_server_and_isolates_users():
     follow_up = memory.apply("alice", None, "有异常吗？")
     assert follow_up.server_id == "server2"
     assert follow_up.operation == "health"
+
+
+def test_short_term_memory_keeps_training_objects_for_followups():
+    memory = ShortTermMemory()
+    intent = OperationIntent(
+        "process_training",
+        "server1",
+        target="258292",
+        target_type="pid",
+    )
+    memory.remember("alice", "查看 PID 258292 的训练情况", "第 10 轮", intent)
+    context = memory.get("alice")
+    assert context.last_pid == "258292"
+    follow_up = memory.apply("alice", None, "它最近十轮效果怎么样？")
+    assert follow_up is not None
+    assert follow_up.operation == "process_training"
+    assert follow_up.target == "258292"
 
 
 def test_planner_uses_context_server_without_llm():
@@ -174,3 +194,60 @@ def test_java_log_sources_supports_all_running_java_processes():
     assert "PID 10984" in output
     assert "PID 25252" in output
     assert "startup.log" in output
+
+
+def test_training_analyzer_finds_latest_and_best_results():
+    csv_text = (
+        "epoch,train/box_loss,train/cls_loss,metrics/mAP50(B),metrics/mAP50-95(B)\n"
+        "1,2.0,1.0,0.20,0.10\n"
+        "2,1.8,0.8,0.30,0.20\n"
+        "3,1.6,0.7,0.35,0.25\n"
+    )
+    analysis = analyze_results_csv(csv_text, total_epochs=10, process_alive=True)
+    assert analysis.current_epoch == 3
+    assert analysis.progress_percent == 30
+    assert analysis.best_epoch == 3
+    assert analysis.latest_metrics["map5095"] == "0.25"
+    assert analysis.status == "RUNNING"
+    assert analysis.trend == "improving"
+
+
+def test_path_inspect_and_process_training_formatters_are_concise():
+    directory_raw = (
+        "__TYPE__|directory\n__PATH__|/home/uav/gu/runs/demo\n__ENTRIES__\n"
+        "d|0|2026-07-16 10:00|weights\n"
+        "f|123|2026-07-16 10:01|results.csv\n"
+        "__TRAINING_CSV_PATH__\n/home/uav/gu/runs/demo/results.csv\n"
+        "__TRAINING_CSV__\n"
+        "epoch,train/box_loss,metrics/mAP50(B),metrics/mAP50-95(B)\n"
+        "1,1.0,0.5,0.3\n2,0.8,0.6,0.4\n"
+    )
+    directory = _format_path_inspect(
+        "AI GPU服务器1",
+        OperationIntent("path_inspect", "server1", target="/home/uav/gu/runs/demo", target_type="path"),
+        directory_raw,
+    )
+    assert "训练目录" in directory
+    assert "第 2 / ? 轮" in directory
+
+    process_raw = (
+        "__PROCESS__\n"
+        "uav 258292 258288 258288 Ssl 13:00:00 89.4 1.9 python\n"
+        "__CWD__\n/home/uav/gu/runs/demo\n"
+        "__CMDLINE__\npython train.py --token <redacted>\n"
+        "__GPU__\n18098\n"
+        "__ARTIFACTS__\n1|123456|/home/uav/gu/runs/demo/results.csv\n"
+        "__CSV_PATH__\n/home/uav/gu/runs/demo/results.csv\n"
+        "__CSV__\n"
+        "epoch,train/box_loss,metrics/mAP50(B),metrics/mAP50-95(B)\n"
+        "1,1.0,0.5,0.3\n2,0.8,0.6,0.4\n"
+        "__CONFIG__\nepochs: 10\n"
+    )
+    process = _format_process_training(
+        "AI GPU服务器1",
+        OperationIntent("process_training", "server1", target="258292", target_type="pid"),
+        process_raw,
+    )
+    assert "第 2 / 10 轮" in process
+    assert "GPU 显存：18098 MiB" in process
+    assert "--token <redacted>" in process

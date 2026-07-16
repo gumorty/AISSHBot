@@ -17,6 +17,7 @@ from pathlib import Path
 import paramiko
 
 from .intent import OperationIntent, detect_intent
+from .training import analyze_results_csv, summarize_status, total_epochs_from_text
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -175,6 +176,42 @@ def _process_detail_command(intent: OperationIntent) -> str:
     )
 
 
+def _process_training_command(intent: OperationIntent) -> str:
+    """Collect bounded metadata for one GPU process, never arbitrary proc data."""
+    pid = _pid_target(intent)
+    return (
+        f"if ps -p {pid} >/dev/null 2>&1; then "
+        "echo '__PROCESS__'; "
+        "ps -p " + pid + " -o user=,pid=,ppid=,pgid=,stat=,etime=,%cpu=,%mem=,comm=; "
+        "echo '__CWD__'; cwd=$(readlink -f /proc/" + pid + "/cwd 2>/dev/null || true); "
+        "case \"$cwd\" in /home/uav|/home/uav/*) printf '%s\\n' \"$cwd\";; *) cwd='';; esac; "
+        "echo '__CMDLINE__'; "
+        "if [ -r /proc/" + pid + "/cmdline ]; then "
+        "tr '\\0' ' ' < /proc/" + pid + "/cmdline | sed -E 's/((password|passwd|token|secret|api[_-]?key|authorization)[=: ]+)[^ ]+/\\1<redacted>/Ig' | cut -c1-360; "
+        "fi; "
+        "echo '__GPU__'; "
+        "if command -v nvidia-smi >/dev/null 2>&1; then "
+        "nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | "
+        "awk -F, -v wanted='" + pid + "' '{gsub(/^[ \\t]+|[ \\t]+$/, \"\", $1); if ($1==wanted) print $2}'; fi; "
+        "echo '__RELATED_GPU_PIDS__'; "
+        "if [ -n \"$cwd\" ] && command -v nvidia-smi >/dev/null 2>&1; then "
+        "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '{gsub(/ /, \"\"); if ($1 ~ /^[0-9]+$/) print $1}' | "
+        "while read -r related; do rcwd=$(readlink -f /proc/\"$related\"/cwd 2>/dev/null || true); "
+        "[ \"$rcwd\" = \"$cwd\" ] && printf '%s\\n' \"$related\"; done | sort -n -u; fi; "
+        "echo '__ARTIFACTS__'; "
+        "if [ -n \"$cwd\" ]; then "
+        "find \"$cwd\" -xdev -maxdepth 5 -type f \\( -name 'results.csv' -o -name 'args.yaml' -o -name 'best.pt' -o -name 'last.pt' -o -name 'results.png' -o -name 'confusion_matrix*.png' -o -name 'PR_curve.png' -o -iname '*.log' \\) "
+        "-size -200M -printf '%T@|%s|%p\\n' 2>/dev/null | sort -nr | head -n 40; "
+        "csv=$(find \"$cwd\" -xdev -maxdepth 5 -type f -name 'results.csv' -size -4M -printf '%T@|%p\\n' 2>/dev/null | sort -nr | head -n 1 | cut -d'|' -f2); "
+        "if [ -n \"$csv\" ]; then echo '__CSV_PATH__'; printf '%s\\n' \"$csv\"; echo '__CSV__'; head -c 4194304 \"$csv\"; "
+        "cfg=$(find \"$(dirname \"$csv\")\" -maxdepth 2 -type f -name 'args.yaml' -size -256k -print -quit 2>/dev/null); "
+        "else cfg=$(find \"$cwd\" -xdev -maxdepth 5 -type f -name 'args.yaml' -size -256k -print -quit 2>/dev/null); fi; "
+        "if [ -n \"$cfg\" ]; then echo '__CONFIG__'; cat \"$cfg\"; fi; "
+        "fi; "
+        "else echo '__MISSING__'; fi"
+    )
+
+
 def _java_log_sources_command(intent: OperationIntent) -> str:
     if intent.target == "all":
         # Keep each ps format as a separate -o option.  This works on the
@@ -219,25 +256,45 @@ def _service_log_command(target: str | None, lines: int = 80) -> str:
     return f"journalctl {units} --no-pager -n {lines} -o short-iso 2>&1 | tail -n {lines}"
 
 
-def _training_overview_command() -> str:
+def _training_overview_command(target: str | None = None, config: dict | None = None) -> str:
+    if target:
+        if config is None:
+            raise GatewayError("训练查询缺少服务器配置。")
+        safe_target = _validate_read_path(target, config)
+        project_setup = (
+            _path_guard_command(safe_target, config)
+            + "; if [ -d \"$resolved\" ]; then scan_root=\"$resolved\"; else scan_root=$(dirname \"$resolved\"); fi; "
+            + "project_rows() { printf 'path|%s\\n' \"$scan_root\"; "
+            + "if command -v nvidia-smi >/dev/null 2>&1; then "
+            + "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '{gsub(/ /, \"\"); if ($1 ~ /^[0-9]+$/) print $1}' | "
+            + "while read -r pid; do cwd=$(readlink -f /proc/\"$pid\"/cwd 2>/dev/null || true); "
+            + "case \"$cwd\" in \"$scan_root\"|\"$scan_root\"/*) printf '%s|%s\\n' \"$pid\" \"$cwd\";; esac; done; fi; }; "
+        )
+    else:
+        project_setup = (
+            "gpu_pids() { nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | "
+            "awk '{gsub(/ /, \"\"); if ($1 ~ /^[0-9]+$/) print $1}'; }; "
+            "project_rows() { gpu_pids | while read -r pid; do cwd=$(readlink -f \"/proc/$pid/cwd\" 2>/dev/null || true); "
+            "case \"$cwd\" in /home/uav|/home/uav/*) printf '%s|%s\\n' \"$pid\" \"$cwd\";; esac; done | sort -u; }; "
+        )
     return (
-        "gpu_pids() { nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | "
-        "awk '{gsub(/ /, \"\"); if ($1 ~ /^[0-9]+$/) print $1}'; }; "
-        "project_rows() { gpu_pids | while read -r pid; do cwd=$(readlink -f \"/proc/$pid/cwd\" 2>/dev/null || true); "
-        "case \"$cwd\" in /home/uav|/home/uav/*) printf '%s|%s\\n' \"$pid\" \"$cwd\";; esac; done | sort -u; }; "
+        project_setup
+        +
         "training_files() { project_rows | while IFS='|' read -r pid cwd; do "
-        "find \"$cwd\" -xdev -maxdepth 5 -type f \\( -iname '*.log' -o -name 'results.csv' -o -name 'metrics*.csv' -o -name 'events.out.tfevents.*' \\) "
-        "! -path '*/.ssh/*' ! -name '.env' ! -name '.env.*' -size -50M -printf '%T@|%s|%p\\n' 2>/dev/null; done; }; "
+        "find \"$cwd\" -xdev -maxdepth 5 -type f \\( -iname '*.log' -o -name 'results.csv' -o -name 'metrics*.csv' -o -name 'args.yaml' -o -name 'best.pt' -o -name 'last.pt' -o -name 'results.png' -o -name 'confusion_matrix*.png' -o -name 'PR_curve.png' \\) "
+        "! -path '*/.ssh/*' ! -name '.env' ! -name '.env.*' -size -200M -printf '%T@|%s|%p\\n' 2>/dev/null; done; }; "
         "echo '__GPU__'; "
         "if command -v nvidia-smi >/dev/null 2>&1; then "
         "nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits; "
         "else echo 'unavailable'; fi; "
         "echo '__PROJECTS__'; project_rows; "
         "echo '__RECENT_LOGS__'; "
-        "training_files | sort -nr | awk -F'|' '!seen[$3]++' | head -n 5; "
-        "latest=$(training_files | sort -nr | awk -F'|' '!seen[$3]++' | head -n 1); "
-        "if [ -n \"$latest\" ]; then record=${latest#*|}; path=${record#*|}; echo '__LATEST_LOG__'; printf 'path=%s\\n' \"$path\"; "
-        "stat -c 'modified=%y\\nsize=%s' \"$path\"; tail -n 120 \"$path\"; fi"
+        "training_files | sort -nr | awk -F'|' '!seen[$3]++' | head -n 12; "
+        "latest=$(training_files | sort -nr | awk -F'|' '$3 ~ /\\/results\\.csv$/ {print; exit}'); "
+        "if [ -n \"$latest\" ]; then record=${latest#*|}; path=${record#*|}; echo '__LATEST_FILE__'; printf 'path=%s\\n' \"$path\"; "
+        "printf 'modified='; stat -c '%y' \"$path\"; printf 'size='; stat -c '%s' \"$path\"; echo '__CSV__'; head -c 4194304 \"$path\"; "
+        "cfg=$(training_files | awk -F'|' '$3 ~ /\\/args\\.yaml$/ {print $3; exit}'); "
+        "if [ -n \"$cfg\" ]; then echo '__CONFIG__'; cat \"$cfg\"; fi; fi"
     )
 
 
@@ -247,6 +304,34 @@ def _file_list_command(path: str, config: dict) -> str:
         + "; [ -d \"$resolved\" ] || { echo '__ERROR__|not_a_directory'; exit 2; }; "
         "echo '__FILES__'; find \"$resolved\" -mindepth 1 -maxdepth 1 \\( -type f -o -type d \\) "
         "-printf '%y|%s|%TY-%Tm-%Td %TH:%TM|%f\\n' 2>/dev/null | sort | head -n 80"
+    )
+
+
+def _path_inspect_command(path: str, config: dict) -> str:
+    """Inspect a path and return bounded metadata for the correct formatter."""
+    return (
+        _path_guard_command(path, config)
+        + "; if [ -d \"$resolved\" ]; then "
+        "echo '__TYPE__|directory'; printf '__PATH__|%s\\n' \"$resolved\"; "
+        "echo '__ENTRIES__'; find \"$resolved\" -mindepth 1 -maxdepth 1 \\( -type f -o -type d \\) "
+        "-printf '%y|%s|%TY-%Tm-%Td %TH:%TM|%f\\n' 2>/dev/null | sort | head -n 40; "
+        "echo '__ACTIVE_PIDS__'; "
+        "if command -v nvidia-smi >/dev/null 2>&1; then "
+        "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '{gsub(/ /, \"\"); if ($1 ~ /^[0-9]+$/) print $1}' | "
+        "while read -r pid; do cwd=$(readlink -f /proc/\"$pid\"/cwd 2>/dev/null || true); case \"$cwd\" in \"$resolved\"|\"$resolved\"/*) printf '%s\\n' \"$pid\";; esac; done; fi; "
+        "csv=$(find \"$resolved\" -xdev -maxdepth 5 -type f -name 'results.csv' -size -4M -printf '%T@|%p\\n' 2>/dev/null | sort -nr | head -n 1 | cut -d'|' -f2); "
+        "if [ -n \"$csv\" ]; then echo '__TRAINING_CSV_PATH__'; printf '%s\\n' \"$csv\"; echo '__TRAINING_CSV__'; head -c 4194304 \"$csv\"; "
+        "cfg=$(find \"$(dirname \"$csv\")\" -maxdepth 2 -type f -name 'args.yaml' -size -256k -print -quit 2>/dev/null); "
+        "if [ -n \"$cfg\" ]; then echo '__CONFIG__'; cat \"$cfg\"; fi; fi; "
+        "else echo '__TYPE__|file'; printf '__PATH__|%s\\n' \"$resolved\"; "
+        "size=$(stat -c %s \"$resolved\" 2>/dev/null || echo 0); modified=$(stat -c %y \"$resolved\" 2>/dev/null || true); "
+        "mime=$(file -b --mime-type \"$resolved\" 2>/dev/null || echo application/octet-stream); "
+        "printf '__META__\\nsize=%s\\nmodified=%s\\nmime=%s\\n' \"$size\" \"$modified\" \"$mime\"; "
+        "case \"$resolved\" in *.csv|*.tsv) echo '__TRAINING_CSV__'; head -c 4194304 \"$resolved\";; "
+        "*.pt|*.pth|*.onnx|*.safetensors) echo '__ARTIFACT__|model';; "
+        "*.png|*.jpg|*.jpeg|*.webp) echo '__ARTIFACT__|image';; "
+        "*.log|*.out) echo '__LOG__'; tail -n 50 \"$resolved\";; "
+        "*) echo '__TEXT__'; tail -n 50 \"$resolved\";; esac; fi"
     )
 
 
@@ -637,7 +722,220 @@ def _format_service_errors(name: str, target: str, raw: str) -> str:
     )
 
 
+def _section(raw: str, start: str, end: str | None = None) -> str:
+    _, marker, content = raw.partition(start)
+    if not marker:
+        return ""
+    if end:
+        content, _, _ = content.partition(end)
+    return content.strip()
+
+
+def _metric_items(metrics: dict[str, str]) -> list[str]:
+    labels = (
+        ("box_loss", "Box Loss"),
+        ("cls_loss", "Cls Loss"),
+        ("map50", "mAP50"),
+        ("map5095", "mAP50-95"),
+        ("precision", "Precision"),
+        ("recall", "Recall"),
+    )
+    return [f"{label}：{metrics[key]}" for key, label in labels if key in metrics]
+
+
+def _training_summary(
+    name: str,
+    analysis,
+    *,
+    run_path: str | None = None,
+    artifacts: list[str] | None = None,
+    prefix: str | None = None,
+) -> str:
+    items = [f"状态：{summarize_status(analysis)}"]
+    if analysis.current_epoch is not None:
+        progress = (
+            f"{analysis.progress_percent:.0f}%"
+            if analysis.progress_percent is not None
+            else "总轮数未知"
+        )
+        total = analysis.total_epochs or "?"
+        items.append(f"进度：第 {analysis.current_epoch} / {total} 轮（{progress}）")
+    if analysis.last_update:
+        items.append(f"最近更新：{analysis.last_update}")
+    if run_path:
+        items.append(f"实验目录：{run_path}")
+    blocks = ["训练状态\n" + _mobile_items(items)]
+    latest = _metric_items(analysis.latest_metrics)
+    if latest:
+        blocks.append("最新指标\n" + _mobile_items(latest))
+    best = _metric_items(analysis.best_metrics)
+    if analysis.best_epoch is not None and best:
+        blocks.append(f"最佳结果：第 {analysis.best_epoch} 轮\n" + _mobile_items(best))
+    trend_labels = {
+        "improving": "最近 10 轮指标仍在改善",
+        "plateau": "最近 10 轮提升较小，可能进入平台期",
+        "declining": "最近 10 轮指标下降，建议检查数据或训练状态",
+        "insufficient_data": "暂时没有足够历史数据判断趋势",
+    }
+    blocks.append("趋势判断\n• " + trend_labels.get(analysis.trend, analysis.trend))
+    if analysis.error_count:
+        blocks.append(f"风险提示\n• 最近采样日志匹配到 {analysis.error_count} 个错误关键词，建议查看具体日志。")
+    if artifacts:
+        blocks.append("关键产物\n" + _mobile_items(artifacts[:8]))
+    title = prefix or f"【{name} · 训练分析】"
+    return title + "\n" + "\n\n".join(blocks)
+
+
+def _parse_artifact_rows(raw: str) -> list[str]:
+    rows = []
+    for line in raw.splitlines():
+        values = line.split("|", 2)
+        if len(values) != 3 or not values[2].startswith("/"):
+            continue
+        _, size, path = values
+        rows.append(f"{Path(path).name}（{_as_int(size) / 1024 / 1024:.1f} MB）")
+    return rows
+
+
+def _format_process_training(name: str, intent: OperationIntent, raw: str) -> str:
+    if "__MISSING__" in raw:
+        return f"【{name} · 训练进程】未找到 PID {intent.target}，它可能已经退出。"
+    process = _section(raw, "__PROCESS__", "__CWD__").strip().splitlines()
+    cwd = _section(raw, "__CWD__", "__CMDLINE__").strip()
+    cmdline = _section(raw, "__CMDLINE__", "__GPU__").strip()
+    gpu = _section(raw, "__GPU__", "__ARTIFACTS__").strip()
+    related = [line.strip() for line in _section(raw, "__RELATED_GPU_PIDS__", "__ARTIFACTS__").splitlines() if line.strip().isdigit()]
+    artifact_part = _section(raw, "__ARTIFACTS__", "__CSV_PATH__")
+    csv_path = _section(raw, "__CSV_PATH__", "__CSV__").strip()
+    csv_text = _section(raw, "__CSV__", "__CONFIG__")
+    config_text = _section(raw, "__CONFIG__")
+    if not process:
+        return f"【{name} · 训练进程】无法读取 PID {intent.target} 的状态。"
+    values = process[0].split(maxsplit=8)
+    status_items = []
+    if len(values) >= 9:
+        _, pid, ppid, pgid, state, elapsed, cpu, memory, command = values
+        state_text = "异常" if state.startswith(("D", "Z")) else "运行中"
+        status_items = [
+            f"PID：{pid} · {state_text} · 程序 {command}",
+            f"父进程：{ppid} · 进程组：{pgid}",
+            f"CPU：{cpu}% · 内存：{memory}% · 已运行 {elapsed}",
+        ]
+    if cwd:
+        status_items.append(f"工作目录：{cwd}")
+    if gpu:
+        status_items.append(f"GPU 显存：{gpu.splitlines()[0].strip()} MiB")
+    if len(related) > 1:
+        status_items.append("同一工作目录的 GPU 进程：" + "、".join(f"PID {item}" for item in related))
+    blocks = ["进程状态\n" + _mobile_items(status_items)]
+    if cmdline:
+        blocks.append("启动信息\n• " + cmdline[:360])
+    if csv_text:
+        errors = len(_ERROR_PATTERN.findall(csv_text))
+        analysis = analyze_results_csv(
+            csv_text,
+            total_epochs=total_epochs_from_text(config_text),
+            process_alive=True,
+            error_count=errors,
+        )
+        analysis_text = _training_summary(
+            name,
+            analysis,
+            run_path=csv_path or cwd or None,
+            artifacts=_parse_artifact_rows(artifact_part),
+            prefix="训练结果",
+        )
+        blocks.append(analysis_text)
+    elif artifact_part:
+        blocks.append("发现的训练产物\n" + _mobile_items(_parse_artifact_rows(artifact_part)[:8]))
+    return f"【{name} · PID {intent.target} · 训练详情】\n" + "\n\n".join(blocks)
+
+
+def _format_path_inspect(name: str, intent: OperationIntent, raw: str) -> str:
+    if "__ERROR__" in raw:
+        return _format_file_error(name, intent.target, raw)
+    path = _section(raw, "__PATH__", "__META__").splitlines()[0] if "__PATH__" in raw else intent.target
+    type_line = _section(raw, "__TYPE__").splitlines()[0]
+    if "directory" in type_line:
+        entries = []
+        for line in _section(raw, "__ENTRIES__", "__TRAINING_CSV_PATH__").splitlines()[:20]:
+            values = line.split("|", 3)
+            if len(values) == 4:
+                kind, size, modified, filename = values
+                entries.append(f"{'目录' if kind == 'd' else '文件'}：{filename}" + (f"（{_as_int(size) / 1024:.0f} KB）" if kind != "d" else ""))
+        csv_text = _section(raw, "__TRAINING_CSV__", "__CONFIG__")
+        if csv_text:
+            active_pids = [line.strip() for line in _section(raw, "__ACTIVE_PIDS__", "__TRAINING_CSV_PATH__").splitlines() if line.strip().isdigit()]
+            analysis = analyze_results_csv(
+                csv_text,
+                total_epochs=total_epochs_from_text(_section(raw, "__CONFIG__")),
+                process_alive=bool(active_pids),
+            )
+            return _training_summary(
+                name,
+                analysis,
+                run_path=_section(raw, "__TRAINING_CSV_PATH__", "__TRAINING_CSV__").strip() or path,
+                artifacts=entries,
+                prefix=f"【{name} · 训练目录】",
+            )
+        title = f"【{name} · 目录检查】\n• 路径：{path}\n• 类型：目录"
+        return title + ("\n\n目录内容\n" + _mobile_items(entries) if entries else "\n• 目录为空或没有可显示内容")
+
+    meta = _kv_and_rows(_section(raw, "__META__", "__TRAINING_CSV__"), marker="__NEVER__")[0]
+    base = [f"路径：{path}", f"大小：{_as_int(meta.get('size')) / 1024:.0f} KB", f"类型：{meta.get('mime', '未知')}"]
+    csv_text = _section(raw, "__TRAINING_CSV__")
+    if csv_text:
+        analysis = analyze_results_csv(csv_text, last_update=meta.get("modified"))
+        return _training_summary(name, analysis, run_path=path, prefix=f"【{name} · 训练文件】")
+    artifact = _section(raw, "__ARTIFACT__").strip()
+    if artifact:
+        base.append("用途：模型权重或训练图片（仅返回元数据，未读取二进制内容）")
+    log_text = _section(raw, "__LOG__") or _section(raw, "__TEXT__")
+    if log_text:
+        lines = [_SECRET_PATTERN.sub(r"\1\2<redacted>", line.strip())[:220] for line in log_text.splitlines()[-20:] if line.strip()]
+        base.append("最近内容\n" + _mobile_items(lines))
+        errors = [line for line in lines if _ERROR_PATTERN.search(line)]
+        if errors:
+            base.append(f"异常提示：发现 {len(errors)} 条错误关键词日志")
+    return f"【{name} · 路径检查】\n" + _mobile_items(base)
+
+
 def _format_training_overview(name: str, raw: str) -> str:
+    csv_text = _section(raw, "__CSV__", "__CONFIG__")
+    if csv_text:
+        project_part = _section(raw, "__PROJECTS__", "__RECENT_LOGS__")
+        recent = _parse_artifact_rows(_section(raw, "__RECENT_LOGS__", "__LATEST_FILE__"))
+        latest = _section(raw, "__LATEST_FILE__", "__CSV__")
+        path = ""
+        modified = ""
+        for line in latest.splitlines():
+            if line.startswith("path="):
+                path = line.split("=", 1)[1]
+            elif line.startswith("modified="):
+                modified = line.split("=", 1)[1]
+        config_text = _section(raw, "__CONFIG__")
+        analysis = analyze_results_csv(
+            csv_text,
+            total_epochs=total_epochs_from_text(config_text),
+            process_alive=any(line.split("|", 1)[0].strip().isdigit() for line in project_part.splitlines()),
+            error_count=len(_ERROR_PATTERN.findall(csv_text)),
+            last_update=modified or None,
+        )
+        project_groups: dict[str, list[str]] = {}
+        for line in project_part.splitlines():
+            if "|" in line and line.split("|", 1)[0].strip().isdigit():
+                pid, project = line.split("|", 1)
+                project_groups.setdefault(project, []).append(pid.strip())
+        project_items = [
+            f"GPU 任务 PID {'、'.join(pids)}：{project}"
+            for project, pids in project_groups.items()
+        ]
+        return _training_summary(
+            name,
+            analysis,
+            run_path=path or (project_items[0].split("：", 1)[1] if project_items else None),
+            artifacts=project_items + recent,
+        )
     gpu_part, _, remainder = raw.partition("__PROJECTS__")
     project_part, _, remainder = remainder.partition("__RECENT_LOGS__")
     logs_part, _, latest_part = remainder.partition("__LATEST_LOG__")
@@ -831,12 +1129,16 @@ def _command_for(intent: OperationIntent, config: dict | None = None) -> str:
         return READONLY_COMMANDS[intent.operation]
     if intent.operation == "process_detail":
         return _process_detail_command(intent)
+    if intent.operation == "process_training":
+        if intent.server_id != "server1":
+            raise GatewayError("指定进程训练分析目前仅在 AI GPU服务器1 开放。")
+        return _process_training_command(intent)
     if intent.operation == "java_log_sources":
         return _java_log_sources_command(intent)
     if intent.operation == "training_overview":
         if intent.server_id != "server1":
             raise GatewayError("训练概览目前仅在 AI GPU服务器1 开放。")
-        return _training_overview_command()
+        return _training_overview_command(intent.target, config)
     if intent.operation == "service_status":
         return _service_status_command(intent.target)
     if intent.operation == "service_logs":
@@ -847,6 +1149,10 @@ def _command_for(intent: OperationIntent, config: dict | None = None) -> str:
         if config is None:
             raise GatewayError("文件查询缺少服务器配置。")
         return _file_list_command(_validate_read_path(intent.target, config), config)
+    if intent.operation == "path_inspect":
+        if config is None:
+            raise GatewayError("路径查询缺少服务器配置。")
+        return _path_inspect_command(_validate_read_path(intent.target, config), config)
     if intent.operation == "file_preview":
         if config is None:
             raise GatewayError("文件查询缺少服务器配置。")
@@ -870,6 +1176,8 @@ def _format_result(intent: OperationIntent, config: dict, code: int, raw: str) -
         return _format_gpu_processes(name, raw)
     if intent.operation == "process_detail":
         return _format_process_detail(name, intent, raw)
+    if intent.operation == "process_training":
+        return _format_process_training(name, intent, raw)
     if intent.operation == "training_overview":
         return _format_training_overview(name, raw)
     if intent.operation == "middleware_overview":
@@ -884,6 +1192,8 @@ def _format_result(intent: OperationIntent, config: dict, code: int, raw: str) -
         return _format_service_errors(name, intent.target, raw)
     if intent.operation == "file_list":
         return _format_file_list(name, intent, raw)
+    if intent.operation == "path_inspect":
+        return _format_path_inspect(name, intent, raw)
     if intent.operation == "file_preview":
         return _format_file_preview(name, intent, raw)
     raise GatewayError("没有对应的结果格式化器")
