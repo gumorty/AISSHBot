@@ -92,6 +92,27 @@ def _training_words(value: str) -> bool:
     ))
 
 
+def _training_detail(value: str) -> str:
+    """Choose the smallest useful answer for the user's training question."""
+    if any(word in value for word in (
+        "趋势", "走势", "最近几轮", "最近十轮", "效果", "提升", "下降", "平台期", "是否变好",
+    )):
+        return "trend"
+    if any(word in value for word in (
+        "第几轮", "到哪一轮", "进度", "完成多少", "跑到哪里", "还要多久",
+    )):
+        return "progress"
+    if any(word in value for word in (
+        "指标", "loss", "map", "精度", "准确率", "召回率", "precision", "recall",
+    )):
+        return "metrics"
+    if any(word in value for word in (
+        "详细", "完整", "产物", "模型文件", "best.pt", "last.pt", "曲线", "混淆矩阵",
+    )):
+        return "detail"
+    return "summary"
+
+
 def detect_intent(message: str, default_server_id: str | None = None) -> OperationIntent | None:
     raw_message = message or ""
     value = re.sub(r"\s+", "", raw_message).lower()
@@ -118,12 +139,14 @@ def detect_intent(message: str, default_server_id: str | None = None) -> Operati
     # same sentence cannot hide the training request.
     if pid and _training_words(value):
         return OperationIntent(
-            "process_training", server_id, assumed, target=pid, target_type="pid", detail="summary"
+            "process_training", server_id, assumed, target=pid, target_type="pid",
+            detail=_training_detail(value),
         )
 
     if path and _training_words(value):
         return OperationIntent(
-            "training_overview", server_id, assumed, target=path, target_type="path", detail="summary"
+            "training_overview", server_id, assumed, target=path, target_type="path",
+            detail=_training_detail(value),
         )
 
     if path and any(word in value for word in ("列出", "目录", "文件夹", "有哪些文件", "文件列表")):
@@ -154,8 +177,11 @@ def detect_intent(message: str, default_server_id: str | None = None) -> Operati
 
     if any(word in value for word in ("gpu进程", "显卡进程", "占用gpu的进程", "gpu上的进程")):
         return OperationIntent("gpu_processes", server_id, assumed)
-    if any(word in value for word in ("论文", "训练", "实验", "epoch", "loss", "step", "训练进度", "训练情况")):
-        return OperationIntent("training_overview", server_id, assumed, target_type="current_run")
+    if _training_words(value):
+        return OperationIntent(
+            "training_overview", server_id, assumed,
+            target_type="current_run", detail=_training_detail(value),
+        )
     if any(word in value for word in ("gpu", "显卡", "nvidia-smi")):
         return OperationIntent("gpu_overview", server_id, assumed)
 
@@ -186,7 +212,7 @@ def llm_planner_prompt(message: str, visible_servers: list[str], context_summary
         "你是 AISSHBot 的受限意图规划器。只能选择 operation、server_id 和 detail；"
         "绝不输出 shell 命令、路径、账号、密码或执行步骤。\n"
         f"允许操作：{fallback_operations}；允许服务器：{visible_servers}。\n"
-        "detail 只允许 count、summary、detail。\n"
+        "detail 只允许 count、summary、progress、trend、metrics、detail。\n"
         f"本地会话上下文：{context_summary or '无'}。\n"
         "只输出 JSON：{\"operation\":\"...\",\"server_id\":\"...\","
         "\"detail\":\"summary\",\"confidence\":0.0}。\n"

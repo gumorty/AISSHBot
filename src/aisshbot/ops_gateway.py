@@ -749,6 +749,7 @@ def _training_summary(
     *,
     run_path: str | None = None,
     artifacts: list[str] | None = None,
+    detail: str = "detail",
     prefix: str | None = None,
 ) -> str:
     items = [f"状态：{summarize_status(analysis)}"]
@@ -760,16 +761,26 @@ def _training_summary(
         )
         total = analysis.total_epochs or "?"
         items.append(f"进度：第 {analysis.current_epoch} / {total} 轮（{progress}）")
-    if analysis.last_update:
+    if analysis.last_update and detail in ("detail", "progress"):
         items.append(f"最近更新：{analysis.last_update}")
-    if run_path:
+    if run_path and detail == "detail":
         items.append(f"实验目录：{run_path}")
     blocks = ["训练状态\n" + _mobile_items(items)]
+    if detail == "progress":
+        return (prefix or f"【{name} · 训练进度】") + "\n" + "\n\n".join(blocks)
+
     latest = _metric_items(analysis.latest_metrics)
+    if detail in ("summary", "trend"):
+        latest = [
+            item for item in latest
+            if item.startswith(("mAP50：", "mAP50-95："))
+        ]
     if latest:
         blocks.append("最新指标\n" + _mobile_items(latest))
     best = _metric_items(analysis.best_metrics)
-    if analysis.best_epoch is not None and best:
+    if detail in ("trend", "metrics", "detail") and analysis.best_epoch is not None and best:
+        if detail == "metrics":
+            best = [item for item in best if item.startswith(("mAP50：", "mAP50-95：", "Precision：", "Recall："))]
         blocks.append(f"最佳结果：第 {analysis.best_epoch} 轮\n" + _mobile_items(best))
     trend_labels = {
         "improving": "最近 10 轮指标仍在改善",
@@ -777,10 +788,14 @@ def _training_summary(
         "declining": "最近 10 轮指标下降，建议检查数据或训练状态",
         "insufficient_data": "暂时没有足够历史数据判断趋势",
     }
-    blocks.append("趋势判断\n• " + trend_labels.get(analysis.trend, analysis.trend))
-    if analysis.error_count:
+    if detail in ("summary", "trend", "detail"):
+        trend_text = trend_labels.get(analysis.trend, analysis.trend)
+        if analysis.trend == "declining" and analysis.best_epoch is not None:
+            trend_text += f"；当前指标低于第 {analysis.best_epoch} 轮最佳值，建议继续观察验证集指标，不直接判定训练失败"
+        blocks.append("趋势判断\n• " + trend_text)
+    if analysis.error_count and detail in ("trend", "detail"):
         blocks.append(f"风险提示\n• 最近采样日志匹配到 {analysis.error_count} 个错误关键词，建议查看具体日志。")
-    if artifacts:
+    if artifacts and detail == "detail":
         blocks.append("关键产物\n" + _mobile_items(artifacts[:8]))
     title = prefix or f"【{name} · 训练分析】"
     return title + "\n" + "\n\n".join(blocks)
@@ -821,14 +836,14 @@ def _format_process_training(name: str, intent: OperationIntent, raw: str) -> st
             f"父进程：{ppid} · 进程组：{pgid}",
             f"CPU：{cpu}% · 内存：{memory}% · 已运行 {elapsed}",
         ]
-    if cwd:
+    if cwd and intent.detail == "detail":
         status_items.append(f"工作目录：{cwd}")
     if gpu:
         status_items.append(f"GPU 显存：{gpu.splitlines()[0].strip()} MiB")
     if len(related) > 1:
         status_items.append("同一工作目录的 GPU 进程：" + "、".join(f"PID {item}" for item in related))
     blocks = ["进程状态\n" + _mobile_items(status_items)]
-    if cmdline:
+    if cmdline and intent.detail == "detail":
         blocks.append("启动信息\n• " + cmdline[:360])
     if csv_text:
         errors = len(_ERROR_PATTERN.findall(csv_text))
@@ -843,6 +858,7 @@ def _format_process_training(name: str, intent: OperationIntent, raw: str) -> st
             analysis,
             run_path=csv_path or cwd or None,
             artifacts=_parse_artifact_rows(artifact_part),
+            detail=intent.detail,
             prefix="训练结果",
         )
         blocks.append(analysis_text)
@@ -876,6 +892,7 @@ def _format_path_inspect(name: str, intent: OperationIntent, raw: str) -> str:
                 analysis,
                 run_path=_section(raw, "__TRAINING_CSV_PATH__", "__TRAINING_CSV__").strip() or path,
                 artifacts=entries,
+                detail=intent.detail,
                 prefix=f"【{name} · 训练目录】",
             )
         title = f"【{name} · 目录检查】\n• 路径：{path}\n• 类型：目录"
@@ -886,7 +903,7 @@ def _format_path_inspect(name: str, intent: OperationIntent, raw: str) -> str:
     csv_text = _section(raw, "__TRAINING_CSV__")
     if csv_text:
         analysis = analyze_results_csv(csv_text, last_update=meta.get("modified"))
-        return _training_summary(name, analysis, run_path=path, prefix=f"【{name} · 训练文件】")
+        return _training_summary(name, analysis, run_path=path, detail=intent.detail, prefix=f"【{name} · 训练文件】")
     artifact = _section(raw, "__ARTIFACT__").strip()
     if artifact:
         base.append("用途：模型权重或训练图片（仅返回元数据，未读取二进制内容）")
@@ -900,7 +917,7 @@ def _format_path_inspect(name: str, intent: OperationIntent, raw: str) -> str:
     return f"【{name} · 路径检查】\n" + _mobile_items(base)
 
 
-def _format_training_overview(name: str, raw: str) -> str:
+def _format_training_overview(name: str, raw: str, detail: str = "summary") -> str:
     csv_text = _section(raw, "__CSV__", "__CONFIG__")
     if csv_text:
         project_part = _section(raw, "__PROJECTS__", "__RECENT_LOGS__")
@@ -935,6 +952,7 @@ def _format_training_overview(name: str, raw: str) -> str:
             analysis,
             run_path=path or (project_items[0].split("：", 1)[1] if project_items else None),
             artifacts=project_items + recent,
+            detail=detail,
         )
     gpu_part, _, remainder = raw.partition("__PROJECTS__")
     project_part, _, remainder = remainder.partition("__RECENT_LOGS__")
@@ -1179,7 +1197,7 @@ def _format_result(intent: OperationIntent, config: dict, code: int, raw: str) -
     if intent.operation == "process_training":
         return _format_process_training(name, intent, raw)
     if intent.operation == "training_overview":
-        return _format_training_overview(name, raw)
+        return _format_training_overview(name, raw, intent.detail)
     if intent.operation == "middleware_overview":
         return _format_middleware(name, raw)
     if intent.operation == "java_log_sources":

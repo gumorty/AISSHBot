@@ -250,4 +250,30 @@ def test_path_inspect_and_process_training_formatters_are_concise():
     )
     assert "第 2 / 10 轮" in process
     assert "GPU 显存：18098 MiB" in process
-    assert "--token <redacted>" in process
+    assert "--token <redacted>" not in process
+    assert "/home/uav/gu/runs/demo" not in process
+
+    detailed_process = _format_process_training(
+        "AI GPU服务器1",
+        OperationIntent(
+            "process_training", "server1", target="258292", target_type="pid", detail="detail"
+        ),
+        process_raw,
+    )
+    assert "--token <redacted>" in detailed_process
+    assert "/home/uav/gu/runs/demo" in detailed_process
+
+
+def test_training_questions_select_different_output_detail_levels():
+    progress = detect_intent("查看当前训练进度")
+    trend = detect_intent("当前模型趋势怎么样")
+    metrics = detect_intent("查看最新训练指标")
+    detail = detect_intent("详细查看训练产物和模型文件")
+    summary = detect_intent("当前训练情况怎么样")
+
+    assert progress.operation == "training_overview"
+    assert progress.detail == "progress"
+    assert trend.detail == "trend"
+    assert metrics.detail == "metrics"
+    assert detail.detail == "detail"
+    assert summary.detail == "summary"

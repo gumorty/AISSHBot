@@ -77,21 +77,23 @@ class ShortTermMemory:
             "训练", "实验", "epoch", "loss", "指标", "效果", "模型", "权重", "曲线", "最佳",
         ))
         if training_follow_up and context.last_pid and context.last_server_id:
+            follow_detail = "trend" if any(word in normalized for word in ("效果", "趋势", "最近几轮", "最近十轮", "提升", "下降")) else "summary"
             return OperationIntent(
                 "process_training",
                 context.last_server_id,
                 False,
                 target=context.last_pid,
-                detail="summary",
+                detail=follow_detail,
                 target_type="pid",
             )
         if training_follow_up and context.last_training_run and context.last_server_id:
+            follow_detail = "trend" if any(word in normalized for word in ("效果", "趋势", "最近几轮", "最近十轮", "提升", "下降")) else "summary"
             return OperationIntent(
                 "training_overview",
                 context.last_server_id,
                 False,
                 target=context.last_training_run,
-                detail="summary",
+                detail=follow_detail,
                 target_type="path",
             )
         if any(word in normalized for word in ("这个目录", "这个文件", "该目录", "该文件")) and context.last_path:

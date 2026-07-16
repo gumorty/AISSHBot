@@ -105,7 +105,7 @@ async def _llm_plan(
         return None
     if target is not None:
         return None
-    if detail not in ("count", "summary", "detail"):
+    if detail not in ("count", "summary", "progress", "trend", "metrics", "detail"):
         detail = "summary"
     return OperationPlan(
         OperationIntent(operation, server_id, False, target=target, detail=detail),
