@@ -11,8 +11,11 @@ from aisshbot.audit.recorder import AuditEvent, InMemoryAuditRecorder, digest
 from aisshbot.compatibility.legacy_tools import LegacyToolAdapter
 from aisshbot.conversation.session_store import SessionKey, SessionStore
 from aisshbot.intent import OperationIntent
+from aisshbot.path_domain import PathKind, classify_path
 from aisshbot.security.policy_engine import PolicyEngine, PolicyViolation
 from aisshbot.tools.registry import ToolDefinition, ToolRegistry, build_default_registry
+from aisshbot.training import TrainingAnalysis
+from aisshbot.training_domain import TrainingTask, classify_training_status
 
 
 def context(**overrides):
@@ -164,3 +167,29 @@ def test_llm_tool_plan_payload_is_structured_but_still_requires_policy():
             {"server_id": "server2", "steps": [{"tool": "process.inspect"}]},
             "alice", {"server1"}, "越权服务器",
         )
+
+
+def test_training_domain_preserves_object_association_and_status_evidence():
+    analysis = TrainingAnalysis(
+        framework="ultralytics",
+        current_epoch=39,
+        total_epochs=150,
+        progress_percent=26.0,
+        latest_metrics={"map50": "0.46"},
+        status="RUNNING",
+    )
+    task = TrainingTask.from_analysis(
+        analysis,
+        server_id="server1",
+        task_id="run-1",
+        run_dir="/home/uav/experiment",
+        pids=("258292", "258293"),
+        gpu_ids=("0", "1"),
+        evidence=("pid.cwd", "results.csv"),
+    )
+    assert task.pids == ("258292", "258293")
+    assert task.progress == 26.0
+    assert task.evidence == ("pid.cwd", "results.csv")
+    assert classify_training_status(process_alive=True, analysis=analysis) == "RUNNING"
+    assert classify_path("results.csv") == PathKind.CSV
+    assert classify_path("weights/best.pt") == PathKind.MODEL
