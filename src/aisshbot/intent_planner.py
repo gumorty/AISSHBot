@@ -18,6 +18,28 @@ class OperationPlan:
     confidence: float
 
 
+async def plan_tool_operation(
+    ap,
+    query,
+    message: str,
+    principal_id: str,
+    allowed_servers: Iterable[str],
+    context: SessionContext | None = None,
+):
+    """New structured-plan entry point; ``plan_operation`` remains compatible."""
+    from .agent.planner import legacy_intent_to_plan
+
+    operation_plan = await plan_operation(ap, query, message, allowed_servers, context)
+    if operation_plan.intent is None or operation_plan.intent.operation in {"inventory", "select_server"}:
+        return None
+    return legacy_intent_to_plan(
+        operation_plan.intent,
+        principal_id=principal_id,
+        goal=message,
+        request_id=None,
+    )
+
+
 def _parse_json(content: str) -> dict | None:
     match = re.search(r"\{.*\}", content or "", re.S)
     if not match:
