@@ -8,10 +8,17 @@ incoming WeChat message
   → known read-only query: execute directly; complex request: immediate PROCESSING_ACK
   → resolve_principal(adapter.name, sender_id)
   → allowed_server_ids() and authorize()
-  → ShortTermMemory.get() + intent_planner.plan_operation()
-  → ShortTermMemory.apply() for follow-up context
-  → execute_readonly()
-  → concise table/summary + audit record + ShortTermMemory.remember()
+  → SessionStore.get() + intent_planner.plan_tool_operation()
+  → ObjectContext resolves active server/PID/training/path/service
+  → PolicyEngine validates ToolPlan and every ToolCall
+  → AgentRuntime / Orchestrator executes within step and output budgets
+  → EvidenceLedger + ResponseComposer produce the answer
+  → audit record + SessionStore record_tool_result()/record_turn()
+
+During migration, `compatibility.legacy_router` and `compatibility.legacy_tools`
+can route the same plan to the existing read-only gateway. Native training,
+file-download and multi-step handlers must replace this adapter before those
+capabilities are enabled for production.
 ```
 
 For recognized operations, `plan_operation()` returns a local rule result and does not call the LLM. Only an unrecognized message may use a fallback planner, which receives the current user text, short context metadata, allowed operation names and allowed asset IDs—never SSH credentials, shell commands, file contents or command output.

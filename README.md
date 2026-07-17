@@ -10,6 +10,12 @@
 → 精简格式化 / 审计 → 微信回复
 ```
 
+当前 Agent 化重构采用兼容迁移方式：`agent.schemas` 定义 ToolPlan/ToolCall/ToolResult，`tools.registry` 管理工具白名单，`security.policy_engine` 在计划和执行前双重校验，`agent.orchestrator` 负责有预算的多步调用，`conversation.session_store` 保存按主体/渠道/会话隔离的对象上下文，`execution.broker` 使用显式 `program + args` 执行契约。旧的 `OperationIntent` 和 `execute_readonly()` 通过 `compatibility` 保留，避免一次性切断现有微信链路。
+
+WaLiSSH 只迁移 ReAct 编排、上下文 Provider、SFTP/终端抽象和流式事件思想；不迁移任意 Shell、自动 sudo、`InheritableThreadLocal` 或宽松路径操作。当前阶段仍只绑定已注册的只读工具，训练多步工具在完成原生结构化处理器前不会通过 Legacy 适配器伪造运行结果。
+
+新接入适配层应优先调用 `intent_planner.plan_tool_operation()` 获取 `ToolPlan`，再把显式 `ExecutionContext` 交给 `PolicyEngine` 和 `Orchestrator`；旧适配层仍可调用 `plan_operation()` + `execute_readonly()`，作为回滚路径。
+
 LLM 只能在本地规则不能确定时，从固定的 `inventory`、`select_server`、`health`、`processes`、`process_detail`、`process_training`、`gpu_overview`、`training_overview`、`java_status`、`middleware_overview` 中选择工具和已授权资产；路径、PID、服务名等动态目标由本地规则校验，LLM 不会获得 SSH 凭据，也不能生成 Shell 命令。
 
 每个内部用户拥有独立的 30 分钟短期上下文，最多保留 6 轮，用于理解“那它呢”“再看一下进程”等追问。上下文只存在于 AISSHBot 进程内，不跨用户共享，服务重启后自动清空。
